@@ -14,7 +14,7 @@ template <GemmType kGemmType,
           uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumGroups, uint32_t kNumTMAMulticast,
           uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N),
-          uint32_t kNumNBlocksPerGroup = 16>
+          uint32_t kNumNBlocksPerGroup = 16>   // kNumNBlocksPerGroup = 16, 控制SWIZZLE, 16表示每个Group沿着N方向计算16个N-Blocks
 struct Scheduler {
     int current_iter = -1;
     uint32_t num_aligned_m_blocks;
@@ -45,14 +45,20 @@ struct Scheduler {
     __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNumNBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
+        // 注意：这里的Group理解为一个CTAs SWIZZLE块，不是warp group!
+        // kNumNBlocksPerGroup = 16; kNumNBlocks=128;
+        // num_m_blocks m维度切分block总数  256/128 = 2
+        // block_idx 当前该计算的 block_idx [0, 132, 264 ...]
         // Swizzle for better L2 usages
-        auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;
-        auto group_idx = block_idx / num_blocks_per_group;
-        auto first_n_block_idx = group_idx * kNumNBlocksPerGroup;
-        auto num_n_blocks_in_group = min(kNumNBlocksPerGroup, kNumNBlocks - first_n_block_idx);
-        auto in_group_idx = block_idx % num_blocks_per_group;
-        m_block_idx = in_group_idx / num_n_blocks_in_group;
-        n_block_idx = first_n_block_idx + in_group_idx % num_n_blocks_in_group;
+
+        // block_idx = 0/128
+        auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;  // 每个wave能够计算的block总数; 2*16 = 32
+        auto group_idx = block_idx / num_blocks_per_group;          // 0/32=0; 128/32=4; 当前block_idx该计算哪个group了
+        auto first_n_block_idx = group_idx * kNumNBlocksPerGroup;   // 0*16=0;  4*16 = 64; 前面已经计算完多少个完整的Block块
+        auto num_n_blocks_in_group = min(kNumNBlocksPerGroup, kNumNBlocks - first_n_block_idx);  // min(16, 128) = 16; min(16, 64) = 16; 在这个group内，还剩余多少N块该计算
+        auto in_group_idx = block_idx % num_blocks_per_group;   // 0; 128%32=0; 在当前group内，该计算哪一块了
+        m_block_idx = in_group_idx / num_n_blocks_in_group;     // 0; idx/n_blcoks = m_blocks_idx
+        n_block_idx = first_n_block_idx + in_group_idx % num_n_blocks_in_group;  // 64;  求n_blocks_idx
     }
 
     template <bool kIgnoreGroupedForGroupedContiguous=true>
@@ -61,6 +67,7 @@ struct Scheduler {
         if constexpr (kGemmType == GemmType::Normal) {
             return block_idx * block_size;
         } else if (kGemmType == GemmType::GroupedContiguous) {
+            // Contiguous Layout中，通过grouped_layout+m_idx获取当前 m块 对应哪个 expert，从而获取到正确的expert坐标
             auto offset = kIgnoreGroupedForGroupedContiguous ? 0 : __ldg(grouped_layout + m_block_idx * BLOCK_M);
             return offset * shape_dim + block_idx * block_size;
         } else if (kGemmType == GemmType::GroupedMasked) {
@@ -79,9 +86,10 @@ struct Scheduler {
                     return false;
 
                 // Within current group
+                // 针对masked layout，一个一个gemm计算，获取当前gemm真实的m维度，计算num_m_blocks
                 num_m_blocks = ceil_div(static_cast<uint32_t>(__ldg(grouped_layout + curr_group_idx)), BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
-                if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
+                if (next_block_idx < current_m_block_cumsum * kNumNBlocks)  //还在当前group内
                     break;
 
                 // Move to check the next group

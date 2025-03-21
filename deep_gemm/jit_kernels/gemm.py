@@ -30,10 +30,11 @@ GemmType::run(out, rhs_scales, nullptr,
               stream, num_sms, smem_size);
 """
 
-
+# (n, best_block_n, 2, num_sms)
 def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms: int) -> bool:
     if num_tma_multicast == 1:
         return True
+    # n可以整除 且 sm总数可以整除num_tma_multicast
     return (n % (block_n * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
 
 
@@ -43,7 +44,7 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
     smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
     smem_scales_b = ceil_div(k, block_k) * 4
-    smem_barrier = num_stages * 8 * 2
+    smem_barrier = num_stages * 8 * 2   # TMA use ClusterTransactionBarrier
 
     smem_size = 0
     smem_size += smem_d
@@ -61,14 +62,16 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         # TODO: for some cases, smaller M block is better, add them into tuning space
         block_ms = (64 if m <= 64 else 128, )
     else:
-        block_ms = (get_m_alignment_for_contiguous_layout(), )
-    block_ns = tuple(range(16, 129, 8))
+        block_ms = (get_m_alignment_for_contiguous_layout(), )   # return 128
+    block_ns = tuple(range(16, 129, 8))   # 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128
 
-    fix_wave_saturate = lambda x: num_sms if x == 0 else x
+    fix_wave_saturate = lambda x: num_sms if x == 0 else x   # 传入x，则返回x；传入0，则返回num_sms
+    # 传入bm, bn；如果bm=0返回None; 如果bm有值，返回 总block计算块，除以num_sms，求得一共计算多少个waves
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
+    # 计算最后一个wave，需要占用多少个SMs; 如果刚好整除，则表示，最后一个wave，占满了num_sms个SMs
     get_last_wave_util = lambda bm, bn: fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms)
 
-    # Decide block sizes by waves
+    # Decide block sizes by waves 根据waves，寻找最佳的block sizes的划分
     best_block_m, best_block_n = None, None
     for block_m in block_ms:
         for block_n in block_ns:
@@ -82,32 +85,44 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                 # Check last wave utilization
                 util = get_last_wave_util(block_m, block_n)
                 best_util = get_last_wave_util(best_block_m, best_block_n)
+
+                # a. util > best_util 找到了新的最优
+                # b. util == best_util，则block_m 大的优；如果再次相等block_n 小的优 ？
                 success = util > best_util or (util == best_util and (block_m > best_block_m or (block_m == best_block_m and block_n < best_block_n)))
             best_block_m, best_block_n = (block_m, block_n) if success else (best_block_m, best_block_n)
     assert best_block_m is not None and best_block_n is not None
+    # 1.find best mn: 128 120
 
-    # Always pick the longest one
+    # Always pick the longest one  # 选择pipeline最长的 = stage最多
     # NOTES: for double B scales, the best number of stages may be reduced
+    # the maximum shared memory per thread block is 227 KB.
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
     for num_stages in (6, 5, 4) if 128 % best_block_n != 0 else (8, 7, 6, 5, 4):
         best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n)
         if best_smem_size <= sm90_capacity:
             best_num_stages = num_stages
-            break
+            break   # 从大到小，找到满足smem条件的即break
     assert best_num_stages is not None
+    # 2.find best_num_stages: 6 best_smem_size: 224672 ≈ 220KB
 
     # Decide the number of TMA multicast
     best_num_tma_multicast = 1
+    # m大 且 可以做tma的multicast 且 非Grouped-Gemm
     if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
         best_num_tma_multicast = 2
+    # 3. find best_num_tma_multicast: 1
 
+    # Commit ed278ed last week
     # Recompute the minimal number of SMs required
-    # NOTES: less L2 cache usage and less GPU frequency drop
-    num_waves = get_num_waves(best_block_m, best_block_n)
+    # NOTES: less L2 cache usage and less GPU frequency drop  #减少L2 Cache的使用，减少不必要的内存访问和Cache抖动，从而降低 GPU 因功耗过高而降低频率的可能性
+    num_waves = get_num_waves(best_block_m, best_block_n)   # 2
     num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
     num_min_sms = ceil_div(max(num_min_sms, num_sms - 8), best_num_tma_multicast) * best_num_tma_multicast
     assert num_min_sms <= num_sms and is_tma_multicast_legal(n, best_block_n, best_num_tma_multicast, num_min_sms)
-
+    # 4. find num_min_sms 128
+    
+    # 确定当前mnk下最优的配置:
+    #        128            128         120                6                  1              224672 ≈ 220KB
     return num_min_sms, best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
 
 
@@ -158,6 +173,9 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
+
+    # [256 x 5120] * [5120 x 15360]	
+    # 实际占用多少sm, 最优的block_mn, 内部多少stages, 是否使用tma_multicast, 占用多少smem
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(

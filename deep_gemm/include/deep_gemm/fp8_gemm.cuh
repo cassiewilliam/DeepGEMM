@@ -14,6 +14,7 @@
 #include "tma_utils.cuh"
 #include "utils.cuh"
 
+#define __CUDA_ARCH__ 900
 namespace deep_gemm {
 
 enum class Layout {
@@ -24,9 +25,11 @@ enum class Layout {
 template <uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup>
 __device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
     DG_STATIC_ASSERT(kNumMathThreadsPerGroup == 128, "Only support 128 threads per math group");
+    // 当且仅当block_m == 64使用一个 math-warp-group, 因为WGMMA未提供M32的指令
     return (block_m == 64 ? 1 : 2) * kNumMathThreadsPerGroup + kNumTMAThreads;
 }
 
+// Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
 template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages,
@@ -43,10 +46,12 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1, "Too much B scales in a single block");
+    DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1, "Too much B scales in a single block");  // tuple(range(16, 129, 8)) 向上取整
 
     // Types
-    using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
+    using WGMMA = typename FP8MMASelector<BLOCK_N>::type;      // 根据BLOCK_N的大小选择 SM90_64xBLOCK_Nx32_F32E4M3E4M3_SS; wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3
+    
+    // Barrier (in SMEM): 阶段位 phase bit value(0/1) + 到达计数 arrival count
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // Shared memory
@@ -59,14 +64,15 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     static constexpr uint32_t SMEM_SCALES_B_SIZE = ceil_div<uint32_t>(SHAPE_K_SCALES * (kMustUseUniformedScaleB ? 1 : 2) * sizeof(float), sizeof(Barrier)) * sizeof(Barrier);
 
     // Configs
-    constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;
-    constexpr uint32_t kNumThreads = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
-    constexpr uint32_t kNumMathThreads = kNumThreads - kNumTMAThreads;
-    constexpr uint32_t kNumIterations = ceil_div(SHAPE_K, kFullKOfAllStages);
-    const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    const uint32_t lane_idx = get_lane_id();
+    constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;   // 所有stage能够计算完的K = 6 x 128 = 768
+    constexpr uint32_t kNumThreads = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);  // 总线程数，128 + (BLOCK_M==64?1:2)*128 = 384
+    constexpr uint32_t kNumMathThreads = kNumThreads - kNumTMAThreads;   // 计算线程 256 (128/256)
+    constexpr uint32_t kNumIterations = ceil_div(SHAPE_K, kFullKOfAllStages);  // 计算所有的k，需要的迭代次数 7 = ceil_div(5120, 768)
+    const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);   // warp shuffle, warp内数据交换指令. 0xffffffff 32个线程同时从0号线程广播threadIdx.x / 32值。（虽然可以直接计算 threadIdx.x / 32，但该指令可以确保同步）
+    const uint32_t lane_idx = get_lane_id();   // 获取线程id [0,31]
 
     // Prefetch TMA descriptors at very beginning
+    // 预加载TMA描述符，优化后续张量操作（如 cp.async.bulk.tensor）的全局内存访问效率
     if (threadIdx.x == kNumMathThreads) {
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_a));
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_b));
@@ -103,8 +109,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(reinterpret_cast<uint8_t*>(smem_scales_b) + SMEM_SCALES_B_SIZE);
     #pragma unroll
     for (int i = 0; i < kNumStages; ++ i) {
-        full_barriers[i] = barrier_start_ptr + i;
-        empty_barriers[i] = barrier_start_ptr + kNumStages + i;
+        full_barriers[i] = barrier_start_ptr + i;  // 生产者(TMA)翻转full_barriers[i]阶段位，以信号其已填充完缓冲区[i]，表明消费者可以进行消费
+        empty_barriers[i] = barrier_start_ptr + kNumStages + i; // 消费者(WGMMA)将翻转 empty_barrier[i] 的阶段位，以信号他们已消费完缓冲区[i]，生产者现在可以写入它
     }
 
     // Initialize barriers
@@ -113,9 +119,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         // NOTES: we always use `lane_idx` to arrive for the `lane_idx`-th CTA in the cluster,
         // even with TMA multicast disabled, we want to make the behavior aligned
         #pragma unroll
-        for (int i = 0; i < kNumStages; ++ i) {
+        for (int i = 0; i < kNumStages; ++ i) {   // 初始化 barrier 的arrive_count, 计数用于决定需要等到多少次线程的到达后，翻转阶段位
             full_barriers[i]->init(1);
-            empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
+            empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);   // 8; (1or2 * 128or256 / 32 = [4/8] or [8/16])
         }
 
         // Make initialized barrier visible in async proxy
@@ -130,35 +136,38 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     struct DivisibleK {};
     struct NotDivisibleK {};
     auto launch_k_iterations = [](const auto& func) {
-        if constexpr (SHAPE_K % kFullKOfAllStages == 0) {
+        if constexpr (SHAPE_K % kFullKOfAllStages == 0) {  // shape_k 能否被 所有stage计算k 整除
             for (int k_iter = 0; k_iter < kNumIterations; ++ k_iter)
                 func(k_iter, DivisibleK{});
-        } else {
+        } else {   // 5120 % 768 = 512
             for (int k_iter = 0; k_iter < kNumIterations - 1; ++ k_iter)
                 func(k_iter, DivisibleK{});
             func(kNumIterations - 1, NotDivisibleK{});
         }
     };
 
-    // Register reconfigurations
+    // Register reconfigurations (CTA reconfigurations): to dealloc and alloc RF to fully utilize the RFs
+    // 共消耗寄存器：(40 + 232 + 232) * 128(threads) = 64512 = 63K
     constexpr int kNumTMARegisters = 40;
-    constexpr int kNumMathRegisters = 232;
+    constexpr int kNumMathRegisters = 232;  // max 255 register / per thread on Hopper
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = Scheduler<kGemmType, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(shape_m, grouped_layout);
 
-    if (threadIdx.x >= kNumMathThreads) {
+    if (threadIdx.x >= kNumMathThreads /*256*/) {
         // TMA warp-group for loading data
-        cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+        cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();  // releases extra registers to reduce the per-thread maximum register count to kNumTMARegisters
 
         // NOTES: only one thread (or warp) will be used
         if (threadIdx.x == kNumMathThreads) {
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-                launch_k_iterations([&](int k_iter, auto type) {
+                launch_k_iterations([&](int k_iter, auto type) {   // k_iter = [0,6], kNumIterations = 7
+
+                    // block_idx_mn = [0,0], [0,64]
                     constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
-                    constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                    constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;   // 128*6*6 + 128*4*1 = 5120
                     DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
                     // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
@@ -166,11 +175,16 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     #pragma unroll
                     for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                         // Wait consumer release
+                        // s[0-6]/[0-4], current_iter[0,1], k_iter[0-6]
+                        // scheduler.current_iter 表示在该调度中，当前CTA计算到第几个Block块了，get_next_block调用一次scheduler.current_iter++；
+                        // scheduler.current_iter = 0: 第一个Block块时，empty_barriers[s]->wait[1-7]
+                        // scheduler.current_iter = 1: 第二个Block块时，empty_barriers[s]->wait[8-14]
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
                         // Issue TMA A with broadcasting
                         auto& full_barrier = *full_barriers[s];
-                        int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
+                        int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;  //k_idx = [0, 128, 256, ... , 4864, 4992]
+                        
                         tma_copy<kNumTMAMulticast>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
                                                    smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
                         tma_copy<kNumTMAMulticast>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
@@ -180,10 +194,13 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         // Issue TMA B without broadcasting
                         tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                  smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                        
+                        // mbarrier.arrive.expect_tx.shared::cta.b64 预期的tma异步传输量(byte为单位)
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
                     }
 
                     // Wait unaligned cases
+                    // 在最后一轮k的循环中，kNumInnerStages=4, kNumStages=6, 剩余两个stage其实是没有任务的，因此无需barrier做等待和同步
                     #pragma unroll
                     for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
@@ -201,7 +218,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         }
     } else {
         // Math warp-groups for WGMMA
-        cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+        cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();  // raise the per-thread maximum register count to kNumMathRegisters
 
         // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / kNumMathThreadsPerGroup, 0);
@@ -211,7 +228,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             // Decide the number of scales B to load
             DG_STATIC_ASSERT(SHAPE_N % 8 == 0, "Invalid shape N");
-            uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
+            uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;   // 120/8=15
+
+            // kMustUseUniformedScaleB 块内可能含有多个scale_b, kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0) = 0
             if constexpr (not kMustUseUniformedScaleB) {
                 num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
                 num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
@@ -220,16 +239,21 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
             // Load B scales with math warp-groups
             // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+            // 第一个计算warp不参与scale_b的load，其余math thread计算线程先load scale_b
             if (threadIdx.x >= 32) {
                 auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
                 auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
                 #pragma unroll
                 for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
+                    // 加载数据到smem
                     st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
             }
+
+            // 命令屏障：用于对线程块内特定的线程子组进行同步控制；此处，对256个math threads进行同步
             cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 
             // Accumulation for WGMMA or CUDA promotion
+            // SM90_64x120x32_F32E4M3E4M3_SS WGMMA::kNumAccum = M * N / 128 = 64 * 120 / 128 = 60 (不是M=64, 64个K累加？)
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
 
             // Empty barrier arrival
@@ -243,19 +267,24 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
             // Launch MMAs
             launch_k_iterations([&](int k_iter, auto type) {
+                // k外循环和TMA一致：kNumIterations=7, kNumStages=6; kNumInnerStages= 6*6 + 4*1
                 constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
                 constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
                 DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
                 #pragma unroll
                 for (int s = 0; s < kNumInnerStages; ++ s) {
+                    // s [0-6]*6 / [0-4]*1
+
                     // Read B scales
+                    // scale_b_0=[0-39]; scale_b_1=[40-79]
                     float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1;
                     // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
-                    if constexpr (not kMustUseUniformedScaleB)
+                    if constexpr (not kMustUseUniformedScaleB)   // SHAPE_K_SCALES = 5120/128=40
                         scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
 
                     // Wait TMA arrivals
+                    // [0-6], [7-13]
                     full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
 
                     // Read A scales
@@ -267,6 +296,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     for (int i = 0; i < WGMMA::kNumAccum; ++ i)
                         warpgroup_fence_operand(accum[i]);
                     warpgroup_arrive();
+
+                    // math_wg_idx: 第二个math warp group 沿着m方向，加载下一块a数据
                     #pragma unroll
                     for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
                         auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
@@ -274,10 +305,12 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         WGMMA::wgmma(desc_a, desc_b, accum, k);
                     }
                     warpgroup_commit_batch();
+
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum; ++ i)
                         warpgroup_fence_operand(accum[i]);
                     warpgroup_wait<0>();
+                    // two-level accumulation (promotion): 第一次精度提升以上通过wgmma，累加器精度 fp8 -> fp22
 
                     // Notify barrier arrival
                     empty_barrier_arrive(s);
@@ -288,8 +321,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     float scale_0_1, scale_1_1;
                     if constexpr (not kMustUseUniformedScaleB)
                         scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                    
+                    // two-level accumulation (promotion): 第二次精度提升，fp22 -> fp32
                     #pragma unroll
-                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {    // WGMMA::kNumAccum=60
                         bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
                         final_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
                         final_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
@@ -307,6 +342,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             });
 
             // Write back to shared memory using STSM
+            // LDSM(ldmatrix) & STSM(stmatrix)
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
             #pragma unroll
             for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
@@ -356,7 +392,7 @@ private:
 public:
     Gemm() = default;
 
-    static void run(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
+    static void run(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout/*dense gemm = nullptr*/,
                     uint32_t shape_m,
                     const CUtensorMap& tma_a_desc,
                     const CUtensorMap& tma_b_desc,
@@ -367,6 +403,8 @@ public:
         // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
         constexpr uint32_t kNumTMAThreads = 128;
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
+        
+        // for dense gemm: BLOCK_K=128, kNumGroups=1
         auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
                                       kNumGroups, kNumStages, kNumTMAThreads, kNumMathThreadsPerGroup,
                                       kNumTMAMulticast, kGemmType>;
@@ -375,7 +413,7 @@ public:
         // Cluster launch
         cudaLaunchConfig_t config;
         config.gridDim = num_sms;
-        config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
+        config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M); // 128 + 128 * (BLOCK_M==64? 1:2)
         config.dynamicSmemBytes = smem_size;
         config.stream = stream;
 
@@ -383,10 +421,13 @@ public:
         // NOTES: `>= 4` cluster size will cause performance degradation
         cudaLaunchAttribute attr;
         attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim = {kNumTMAMulticast, 1, 1};
+        attr.val.clusterDim = {kNumTMAMulticast, 1, 1};  // Cluster Dim {1,1,1} / {2,1,1}
         config.attrs = &attr;
         config.numAttrs = 1;
 
+        // shape_mnk:[256 15360 5120], block_mnk:[128 120 128], kNumGroups: 1, kNumStages: 6
+        // kNumTMAThreads: 128, kNumMathThreadsPerGroup: 128 * 2, kNumTMAMulticast: 1
+        // griddim,num_sms: 128, blockdim: 384 (128 + 2*128), smem_size: 224672
         // Launch
         auto status = cudaLaunchKernelEx(&config, kernel,
                                          gmem_d, scales_b, grouped_layout,

@@ -211,3 +211,38 @@ This code repository is released under [the MIT License](LICENSE).
       howpublished = {\url{https://github.com/deepseek-ai/DeepGEMM}},
 }
 ```
+
+```
+DeepGEMM
+├─ deep_gemm
+│  ├─ __init__.py
+│  ├─ include
+│  │  └─ deep_gemm             Deep_Gemm核心代码目录
+│  │     ├─ fp8_gemm.cuh       Gemm计算核心代码
+│  │     ├─ mma_utils.cuh      封装了以 wgmma 为主的 PTX 指令
+│  │     ├─ scheduler.cuh      ThreadBlock块调度模块
+│  │     ├─ tma_utils.cuh      封装TMA相关函数
+│  │     └─ utils.cuh          其余辅助函数
+│  ├─ jit
+│  │  ├─ __init__.py
+│  │  ├─ compiler.py           JIT编译脚本
+│  │  ├─ interleave_ffma.py    SASS修改脚本
+│  │  ├─ runtime.py            JIT Runtime相关参数
+│  │  └─ template.py           代码模板
+│  ├─ jit_kernels
+│  │  ├─ __init__.py
+│  │  ├─ gemm.py               Dense-Gemm 调用示例
+│  │  ├─ m_grouped_gemm.py     Grouped-Gemm 调用示例
+│  │  ├─ tuner.py              JIT compile_and_tune，代码tune和编程生成
+│  │  └─ utils.py              其余辅助函数
+│  └─ utils.py
+├─ figures
+│  └─ design.png
+├─ setup.py
+├─ tests
+│  ├─ test_core.py             Deep_Gemm测试文件
+│  └─ test_jit.py              JIT测试文件
+└─ third-party
+   └─ cutlass                  依赖库CUTLASS
+
+```
