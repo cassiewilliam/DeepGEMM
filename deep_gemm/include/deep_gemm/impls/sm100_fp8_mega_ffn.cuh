@@ -92,6 +92,7 @@ template <
     uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kClusterDim    = 1,
+    uint32_t kL2KSplit      = 1,   // Step3: Linear2 K 维拆分份数 (e.g. 2 → gridDim = 2*kL2OutputBlocksN)
     bool     kFastMath      = true,
     // Derived constants
     uint32_t kNumThreads    = kNumNonEpilogueThreads + kNumEpilogueThreads,
@@ -99,6 +100,7 @@ template <
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_mega_ffn_impl(
     void* y,
+    float* y_fp32,                 // Step3: fp32 累加 buffer, 仅当 kL2KSplit > 1 使用; host 每次 launch 前 memset 0
     void* workspace,               // FP8 intermediate, shared [kMaxM][kIntermediate] (共享, N-split 写)
     void* workspace_sf,            // UE8M0 scale factors, K-major [kIntermediate/128, kMaxM, 4]
     uint32_t* l1_done_counter,     // global counter, host 端 memset 0; 用作 Linear1→Linear2 cross-CTA barrier
@@ -181,11 +183,18 @@ sm100_fp8_mega_ffn_impl(
     constexpr uint32_t kL2KBlocks         = kIntermediate / BLOCK_K;         // e.g. 24
     constexpr uint32_t L1_OUT_BLOCK_N     = BLOCK_N / 2;                     // SwiGLU 减半
 
-    // Linear1 跨 CTA N-split：gridDim.x == kL2OutputBlocksN，每 CTA 负责 kL1NPerCta 个 L1 N-tile。
-    // 对 Qwen3-0.6B：48 / 8 = 6。每 CTA 只算 1/8 的 Linear1，消除原 8× 冗余。
-    DG_STATIC_ASSERT(kL1OutputBlocksN % kL2OutputBlocksN == 0,
-                     "L1 N-tile count must be divisible by L2 N-tile count for even split");
-    constexpr uint32_t kL1NPerCta         = kL1OutputBlocksN / kL2OutputBlocksN; // e.g. 6
+    // Step 3：Linear2 K 拆分 (kL2KSplit) —— gridDim = kL2OutputBlocksN * kL2KSplit。
+    //   - kL2KSplit == 1：Step 2 行为，每 CTA 跑满 kL2KBlocks 个 L2 K 块。
+    //   - kL2KSplit >= 2：每 L2 N-tile 分给 kL2KSplit 个 CTA，每 CTA 只跑 kL2KBlocks/kL2KSplit
+    //                     个 K 块产生 partial，再 atomicAdd fp32 到 y_fp32 合并。
+    // Linear1 始终跨所有 CTA (gridDim.x) 均摊 N-split。
+    DG_STATIC_ASSERT(kL2KBlocks % kL2KSplit == 0,
+                     "L2 K block count must be divisible by kL2KSplit");
+    DG_STATIC_ASSERT(kL1OutputBlocksN % (kL2OutputBlocksN * kL2KSplit) == 0,
+                     "L1 N-tile count must be divisible by gridDim (= kL2OutputBlocksN * kL2KSplit)");
+    constexpr uint32_t kNumCTAs           = kL2OutputBlocksN * kL2KSplit;         // e.g. 8 or 16
+    constexpr uint32_t kL1NPerCta         = kL1OutputBlocksN / kNumCTAs;          // 6 or 3
+    constexpr uint32_t kL2KBlocksPerCta   = kL2KBlocks / kL2KSplit;               // 24 or 12
 
     // -----------------------------------------------------------------------------
     // 坐标系 / 线程角色
@@ -197,10 +206,17 @@ sm100_fp8_mega_ffn_impl(
 
     // 本 CTA 负责 Linear2 的哪几个 N-tile（循环覆盖 kL2OutputBlocksN）
     const uint32_t num_ctas = gridDim.x;
-    // 简化：gridDim.x 必须能均分 kL2OutputBlocksN（host 端保证）
-    const uint32_t kL2NPerCta = kL2OutputBlocksN / num_ctas > 0 ? kL2OutputBlocksN / num_ctas : 1;
+    // Step3: 一个 CTA 只负责 1 个 L2 N-tile (即使 gridDim > kL2OutputBlocksN 也是)
+    constexpr uint32_t kL2NPerCta = 1;
 
-    // Linear1 本 CTA 负责的起始 N-tile
+    // Step3: cta_idx 解码
+    //   l2_n_tile_for_cta  = cta_idx % kL2OutputBlocksN   (归属的 L2 N-tile, 0..7)
+    //   l2_k_half_for_cta  = cta_idx / kL2OutputBlocksN   (K 拆分里的第几份, 0..kL2KSplit-1)
+    const uint32_t l2_n_tile_for_cta = cta_idx % kL2OutputBlocksN;
+    const uint32_t l2_k_half_for_cta = cta_idx / kL2OutputBlocksN;
+    const uint32_t l2_k_base_block   = l2_k_half_for_cta * kL2KBlocksPerCta;
+
+    // Linear1 本 CTA 负责的起始 N-tile (N-split 均摊到所有 CTA)
     const uint32_t kL1NStart = cta_idx * kL1NPerCta;
 
     // Prefetch 所有 TMA descriptor
@@ -376,7 +392,11 @@ sm100_fp8_mega_ffn_impl(
                               uint32_t num_n_blocks, uint32_t /*n_base*/) {
             constexpr Phase phase_tag = decltype(phase_tag_c)::value;
             MFFN_TRACE("TMA-A loop phase=%d n_blocks=%u", (int)phase_tag, num_n_blocks);
-            constexpr uint32_t num_k_blocks = (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocks;
+            constexpr uint32_t num_k_blocks =
+                (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocksPerCta;
+            // Step 3: Linear2 的 K-block 基准偏移 (K-split 段起点)
+            const uint32_t k_base_block =
+                (phase_tag == Phase::Linear1) ? 0u : l2_k_base_block;
             const uint32_t m_idx = 0;
 
             for (uint32_t n_tile = 0; n_tile < num_n_blocks; ++ n_tile) {
@@ -385,9 +405,10 @@ sm100_fp8_mega_ffn_impl(
                     empty_barriers[stage_idx]->wait(phase ^ 1);
                     MFFN_TRACE("TMA-A post-empty_wait stage=%u phase=%u kblk=%u", stage_idx, phase, k_block_idx);
 
-                    uint32_t k_idx    = k_block_idx * BLOCK_K;
+                    const uint32_t abs_k_block = k_base_block + k_block_idx;
+                    uint32_t k_idx        = abs_k_block * BLOCK_K;
                     uint32_t sfa_m_idx    = 0;
-                    uint32_t sfa_k128_idx = k_block_idx;
+                    uint32_t sfa_k128_idx = abs_k_block;
 
                     if (cute::elect_one_sync()) {
                         MFFN_TRACE("TMA-A pre copy A stage=%u kblk=%u ntile=%u desc_a=%p desc_sf=%p",
@@ -433,7 +454,11 @@ sm100_fp8_mega_ffn_impl(
                               uint32_t num_n_blocks, uint32_t n_base) {
             constexpr Phase phase_tag = decltype(phase_tag_c)::value;
             MFFN_TRACE("TMA-B loop phase=%d n_blocks=%u", (int)phase_tag, num_n_blocks);
-            constexpr uint32_t num_k_blocks = (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocks;
+            constexpr uint32_t num_k_blocks =
+                (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocksPerCta;
+            // Step 3: Linear2 的 K-block 基准偏移 (K-split 段起点)
+            const uint32_t k_base_block =
+                (phase_tag == Phase::Linear1) ? 0u : l2_k_base_block;
 
             for (uint32_t n_tile = 0; n_tile < num_n_blocks; ++ n_tile) {
                 const uint32_t n_idx = (n_base + n_tile) * BLOCK_N;
@@ -442,9 +467,10 @@ sm100_fp8_mega_ffn_impl(
                     empty_barriers[stage_idx]->wait(phase ^ 1);
                     MFFN_TRACE("TMA-B post-empty_wait stage=%u phase=%u kblk=%u", stage_idx, phase, k_block_idx);
 
-                    uint32_t k_idx     = k_block_idx * BLOCK_K;
+                    const uint32_t abs_k_block = k_base_block + k_block_idx;
+                    uint32_t k_idx        = abs_k_block * BLOCK_K;
                     uint32_t sfb_n_idx    = n_idx;
-                    uint32_t sfb_k128_idx = k_block_idx;
+                    uint32_t sfb_k128_idx = abs_k_block;
 
                     if (cute::elect_one_sync()) {
                         MFFN_TRACE("TMA-B pre copy B stage=%u kblk=%u ntile=%u desc_b=%p desc_sf=%p",
@@ -472,9 +498,10 @@ sm100_fp8_mega_ffn_impl(
                    &tensor_map_w1, &tensor_map_w1_sf,
                    kL1NPerCta, kL1NStart);
         grid_sync_l1_to_l2();
+        // Step 3：Linear2 的 N-tile 由 cta_idx % kL2OutputBlocksN 决定（与 K-split 无关）
         tma_b_loop(std::integral_constant<Phase, Phase::Linear2>{},
                    &tensor_map_w2, &tensor_map_w2_sf,
-                   kL2NPerCta, cta_idx * kL2NPerCta);
+                   kL2NPerCta, l2_n_tile_for_cta);
 
     // =========================================================================
     // 角色 ③：MMA warp —— 发 UMMA 指令、UTCCP SF、commit barrier
@@ -524,7 +551,9 @@ sm100_fp8_mega_ffn_impl(
 
         auto run_mma = [&](Phase phase_tag, uint32_t num_n_blocks) {
             MFFN_TRACE("MMA loop phase=%d n_blocks=%u", (int)phase_tag, num_n_blocks);
-            const uint32_t num_k_blocks = (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocks;
+            // Step 3：Linear2 在 K-split 下每 CTA 只跑 kL2KBlocksPerCta 个 K 块
+            const uint32_t num_k_blocks =
+                (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocksPerCta;
             for (uint32_t n_tile = 0; n_tile < num_n_blocks; ++ n_tile) {
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
                 const auto accum_phase     = (current_iter_idx / kNumEpilogueStages) & 1;
@@ -837,7 +866,8 @@ sm100_fp8_mega_ffn_impl(
             ptx::tcgen05_after_thread_sync();
 
             const uint32_t valid_m = num_tokens;
-            const uint32_t global_n_tile = cta_idx * kL2NPerCta + n_tile;
+            // Step 3: global N-tile 由 cta_idx % kL2OutputBlocksN 决定 (与 K-split 无关)
+            const uint32_t global_n_tile = l2_n_tile_for_cta + n_tile;
 
             // Phase 1: TMEM load 128 floats per lane
             uint32_t values[BLOCK_N];  // 128 uint32 (=floats) per lane
@@ -853,46 +883,65 @@ sm100_fp8_mega_ffn_impl(
             ptx::tcgen05_before_thread_sync();
             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
 
-            // Phase 2: SMEM 写双缓冲等待
-            const uint32_t tma_stage_idx = tma_stage_idx_l2;
-            ptx::tma_store_wait<kNumTMAStoreStages - 1>();
-            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            if constexpr (kL2KSplit == 1) {
+                // ---- Step 2 行为：cast BF16 + SMEM STSM + TMA store 到 tma_y ----
+                // Phase 2: SMEM 写双缓冲等待
+                const uint32_t tma_stage_idx = tma_stage_idx_l2;
+                ptx::tma_store_wait<kNumTMAStoreStages - 1>();
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
-            // Phase 3: cast fp32 -> BF16, 写 SMEM (每 lane 1 row × 128 cols × 2B = 256B)
-            auto smem_cd_base = reinterpret_cast<uint8_t*>(smem_cd_l2[tma_stage_idx]);
-            if (m_row < valid_m) {
-                auto dst = smem_cd_base + m_row * BLOCK_N * sizeof(cd_dtype_t);
-                #pragma unroll
-                for (uint32_t i = 0; i < kL2AtomsPerTile; ++ i) {
-                    auto* v = &values[i * ATOM_N];
-                    // 每 2 个 fp32 → 1 个 uint32 (2 个 BF16 打包)；8 个 fp32 → 4 个 uint32 = 1 次 v4.u32
-                    const uint32_t p0 = math::cast_into_bf16_and_pack(v[0], v[1]);
-                    const uint32_t p1 = math::cast_into_bf16_and_pack(v[2], v[3]);
-                    const uint32_t p2 = math::cast_into_bf16_and_pack(v[4], v[5]);
-                    const uint32_t p3 = math::cast_into_bf16_and_pack(v[6], v[7]);
-                    auto row_dst = dst + i * ATOM_N * sizeof(cd_dtype_t);
-                    ptx::st_shared(row_dst, p0, p1, p2, p3);
+                // Phase 3: cast fp32 -> BF16, 写 SMEM (每 lane 1 row × 128 cols × 2B = 256B)
+                auto smem_cd_base = reinterpret_cast<uint8_t*>(smem_cd_l2[tma_stage_idx]);
+                if (m_row < valid_m) {
+                    auto dst = smem_cd_base + m_row * BLOCK_N * sizeof(cd_dtype_t);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kL2AtomsPerTile; ++ i) {
+                        auto* v = &values[i * ATOM_N];
+                        const uint32_t p0 = math::cast_into_bf16_and_pack(v[0], v[1]);
+                        const uint32_t p1 = math::cast_into_bf16_and_pack(v[2], v[3]);
+                        const uint32_t p2 = math::cast_into_bf16_and_pack(v[4], v[5]);
+                        const uint32_t p3 = math::cast_into_bf16_and_pack(v[6], v[7]);
+                        auto row_dst = dst + i * ATOM_N * sizeof(cd_dtype_t);
+                        ptx::st_shared(row_dst, p0, p1, p2, p3);
+                    }
+                }
+
+                cute::tma_store_fence();
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                    const uint32_t out_n_idx = global_n_tile * BLOCK_N;
+                    const uint32_t out_m_idx = 0;
+                    cute::SM90_TMA_STORE_2D::copy(
+                        &tensor_map_y,
+                        smem_cd_base,
+                        out_n_idx, out_m_idx);
+                    cute::tma_store_arrive();
+                }
+                __syncwarp();
+                tma_stage_idx_l2 = (tma_stage_idx_l2 + 1) % kNumTMAStoreStages;
+            } else {
+                // ---- Step 3 K-split 行为：直接 atomicAdd(float2) 到 y_fp32 合并 ----
+                // y_fp32 是 [kMaxM, kHidden] fp32, host 每次 launch 前已 memset 0.
+                // 每 lane 持有 BLOCK_N fp32, 按 2 个一组 (float2) 做 64 次 atomicAdd.
+                if (m_row < valid_m) {
+                    auto* y_row = y_fp32 + static_cast<size_t>(m_row) * kHidden
+                                         + static_cast<size_t>(global_n_tile) * BLOCK_N;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < BLOCK_N / 2; ++ i) {
+                        const float a = __uint_as_float(values[2 * i + 0]);
+                        const float b = __uint_as_float(values[2 * i + 1]);
+                        atomicAdd(reinterpret_cast<float2*>(y_row + 2 * i),
+                                  make_float2(a, b));
+                    }
                 }
             }
-
-            cute::tma_store_fence();
-            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-
-            if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                const uint32_t out_n_idx = global_n_tile * BLOCK_N;
-                const uint32_t out_m_idx = 0;
-                cute::SM90_TMA_STORE_2D::copy(
-                    &tensor_map_y,
-                    smem_cd_base,
-                    out_n_idx, out_m_idx);
-                cute::tma_store_arrive();
-            }
-            __syncwarp();
-            tma_stage_idx_l2 = (tma_stage_idx_l2 + 1) % kNumTMAStoreStages;
         }
 
-        // 等所有 TMA store 完成
-        ptx::tma_store_wait<0>();
+        // 等所有 TMA store 完成 (kL2KSplit==1) / atomicAdd 本身立即可见 (kL2KSplit>=2)
+        if constexpr (kL2KSplit == 1) {
+            ptx::tma_store_wait<0>();
+        }
         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
         // 释放 TMEM

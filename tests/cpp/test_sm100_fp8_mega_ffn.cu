@@ -95,14 +95,29 @@ constexpr uint32_t BLOCK_K       = 128;
 #ifndef MFFN_CLUSTER_DIM
 #define MFFN_CLUSTER_DIM 1
 #endif
+// Step 3：Linear2 K 拆分份数。=1 回到 Step 2；=2 将 gridDim 翻倍用 fp32 atomicAdd 合并。
+#ifndef MFFN_L2_K_SPLIT
+#define MFFN_L2_K_SPLIT 2
+#endif
 
 constexpr uint32_t kNumStages    = MFFN_STAGES;
 
 constexpr uint32_t kNumNonEpiThreads = 128;
 constexpr uint32_t kNumEpiThreads    = MFFN_EPI_THREADS;  // 4 warps = 128 threads
 constexpr uint32_t kClusterDim       = MFFN_CLUSTER_DIM;
-constexpr uint32_t kNumCTAs          = kHidden / BLOCK_N;   // 8
+constexpr uint32_t kL2KSplit         = MFFN_L2_K_SPLIT;
+constexpr uint32_t kNumCTAs          = (kHidden / BLOCK_N) * kL2KSplit;  // 8 or 16
 constexpr uint32_t kL2NPerCta        = 1;                    // (每 CTA 处理 1 个 Linear2 输出 N-tile)
+
+// Step 3：fp32 → BF16 cast kernel（K-split 合并后执行一次）
+__global__ void cast_y_fp32_to_bf16_kernel(nv_bfloat16* __restrict__ y_bf16,
+                                           const float* __restrict__ y_fp32,
+                                           uint32_t M, uint32_t H) {
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = M * H;
+    if (tid >= total) return;
+    y_bf16[tid] = __float2bfloat16(y_fp32[tid]);
+}
 
 constexpr uint32_t kGranK = 32;
 
@@ -443,6 +458,7 @@ int main(int argc, char** argv) {
     uint8_t* d_w2      = nullptr;
     uint8_t* d_w2_sf   = nullptr;
     nv_bfloat16* d_y   = nullptr;
+    float*    d_y_fp32           = nullptr;   // Step 3: fp32 累加 buffer (kL2KSplit > 1 使用)
     // Step 2 起：workspace 跨 CTA 共享，单例 2D 布局（去掉 num_ctas 维度）。
     uint8_t*  d_ws               = nullptr;   // [kMaxM, kIntermediate] FP8
     uint8_t*  d_ws_sf            = nullptr;   // [kIntermediate/128, kMaxM, 4] uint8 (K-major uint32 viewed as byte)
@@ -455,6 +471,7 @@ int main(int argc, char** argv) {
     const size_t bytes_w2 = static_cast<size_t>(kHidden) * kIntermediate;
     const size_t bytes_w2s= static_cast<size_t>(kHidden) * (kIntermediate / kGranK);
     const size_t bytes_y  = static_cast<size_t>(kMaxM) * kHidden * sizeof(nv_bfloat16);
+    const size_t bytes_y_fp32 = static_cast<size_t>(kMaxM) * kHidden * sizeof(float);
     const size_t bytes_ws    = static_cast<size_t>(kMaxM) * kIntermediate;
     const size_t bytes_ws_sf = static_cast<size_t>(kMaxM) * (kIntermediate / kGranK);
 
@@ -465,6 +482,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_w2,    bytes_w2));
     CUDA_CHECK(cudaMalloc(&d_w2_sf, bytes_w2s));
     CUDA_CHECK(cudaMalloc(&d_y,     bytes_y));
+    CUDA_CHECK(cudaMalloc(&d_y_fp32,           bytes_y_fp32));
     CUDA_CHECK(cudaMalloc(&d_ws,               bytes_ws));
     CUDA_CHECK(cudaMalloc(&d_ws_sf,            bytes_ws_sf));
     CUDA_CHECK(cudaMalloc(&d_l1_done_counter,  sizeof(uint32_t)));
@@ -568,7 +586,7 @@ int main(int argc, char** argv) {
         BLOCK_M, BLOCK_N, BLOCK_K,
         kNumStages,
         kNumNonEpiThreads, kNumEpiThreads,
-        kClusterDim>;
+        kClusterDim, kL2KSplit>;
 
     // 计算 dynamic smem size (与 kernel 中一致)
     constexpr uint32_t UMMA_N = BLOCK_N;
@@ -626,8 +644,13 @@ int main(int argc, char** argv) {
     auto do_launch = [&]() {
         // Linear1→Linear2 barrier counter 每次 launch 前清零
         CUDA_CHECK(cudaMemsetAsync(d_l1_done_counter, 0, sizeof(uint32_t), cfg.stream));
+        if constexpr (kL2KSplit > 1) {
+            // Step 3：fp32 累加 buffer 需清零，否则 atomicAdd 会带进上一次残留
+            CUDA_CHECK(cudaMemsetAsync(d_y_fp32, 0, bytes_y_fp32, cfg.stream));
+        }
         CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel,
             static_cast<void*>(d_y),
+            d_y_fp32,
             static_cast<void*>(d_ws),
             static_cast<void*>(d_ws_sf),
             d_l1_done_counter,
@@ -635,6 +658,13 @@ int main(int argc, char** argv) {
             tma_x, tma_x_sf, tma_w1, tma_w1_sf, tma_w2, tma_w2_sf,
             tma_interm, tma_interm_load, tma_interm_sf, tma_interm_sf_load,
             tma_y));
+        if constexpr (kL2KSplit > 1) {
+            const uint32_t total = M * kHidden;
+            const uint32_t threads = 256;
+            const uint32_t blocks = (total + threads - 1) / threads;
+            cast_y_fp32_to_bf16_kernel<<<blocks, threads, 0, cfg.stream>>>(
+                d_y, d_y_fp32, M, kHidden);
+        }
     };
 
     // Warmup + correctness
@@ -731,7 +761,7 @@ int main(int argc, char** argv) {
     cudaFree(d_x); cudaFree(d_x_sf);
     cudaFree(d_w1); cudaFree(d_w1_sf);
     cudaFree(d_w2); cudaFree(d_w2_sf);
-    cudaFree(d_y);
+    cudaFree(d_y); cudaFree(d_y_fp32);
     cudaFree(d_ws); cudaFree(d_ws_sf);
     cudaFree(d_l1_done_counter);
     cudaEventDestroy(e0); cudaEventDestroy(e1);

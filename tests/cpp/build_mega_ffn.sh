@@ -79,6 +79,7 @@ fi
 if [[ -n "${STAGES:-}" ]];      then FLAGS+=(-DMFFN_STAGES=${STAGES}); fi
 if [[ -n "${EPI_THREADS:-}" ]]; then FLAGS+=(-DMFFN_EPI_THREADS=${EPI_THREADS}); fi
 if [[ -n "${CLUSTER_DIM:-}" ]]; then FLAGS+=(-DMFFN_CLUSTER_DIM=${CLUSTER_DIM}); fi
+if [[ -n "${L2_K_SPLIT:-}" ]];  then FLAGS+=(-DMFFN_L2_K_SPLIT=${L2_K_SPLIT}); fi
 
 LIBS=(
     "-L${CUDA_HOME}/lib64"
