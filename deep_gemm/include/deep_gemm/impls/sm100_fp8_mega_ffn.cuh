@@ -791,6 +791,17 @@ sm100_fp8_mega_ffn_impl(
         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
         // --- Linear2 epilogue loop ---
+        //
+        // 新设计（per-lane = 1 M row）：
+        //   - 每 lane 读自己所在 warp 的 TMEM subpartition 中的 1 行 × 128 N cols (kL2AtomsPerTile=16)
+        //   - 每 8 个 float 打包成 4 个 BF16 pair (8 BF16 = 16 bytes)，直接 st.shared.v4.u32 线性写入 SMEM
+        //   - SMEM 布局: [BLOCK_M][BLOCK_N] BF16, 线性无 swizzle (与 tma_y SWIZZLE_NONE 一致)
+        //   - 每 n_tile 结束由 warp 0 elect_one 发起 SM90_TMA_STORE_2D
+        //
+        // 输出 SMEM 每行 BLOCK_N*2 = 256 bytes。m_row * 256 + col_offset。
+
+        constexpr uint32_t kL2AtomsPerTile = BLOCK_N / ATOM_N;  // 128/8 = 16
+
         uint32_t tma_stage_idx_l2 = 0;
         for (uint32_t n_tile = 0; n_tile < kL2NPerCta; ++ n_tile) {
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
@@ -803,65 +814,55 @@ sm100_fp8_mega_ffn_impl(
             const uint32_t valid_m = num_tokens;
             const uint32_t global_n_tile = cta_idx * kL2NPerCta + n_tile;
 
+            // Phase 1: TMEM load 128 floats per lane
+            uint32_t values[BLOCK_N];  // 128 uint32 (=floats) per lane
+            const uint32_t tmem_base = accum_stage_idx * UMMA_N;
             #pragma unroll
-            for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
-                if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
-                    ptx::tcgen05_before_thread_sync();
-                    tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                    break;
-                }
-
-                const uint32_t tma_stage_idx = s % kNumTMAStoreStages;
-                ptx::tma_store_wait<kNumTMAStoreStages - 1>();
-                ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
-
-                #pragma unroll
-                for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
-                    uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
-                    uint32_t values[ATOM_M];
-                    cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
-                        values[0], values[1], values[2], values[3]);
-                    cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
-                        values[4], values[5], values[6], values[7]);
-                    cutlass::arch::fence_view_async_tmem_load();
-
-                    if (s == WG_BLOCK_M / STORE_BLOCK_M - 1 and i == STORE_BLOCK_M / ATOM_M - 1) {
-                        ptx::tcgen05_before_thread_sync();
-                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                    }
-
-                    // STSM with 128B swizzle pattern
-                    uint32_t row = lane_idx % 8;
-                    uint32_t col = (epilogue_warp_idx % 2) * 4 + lane_idx / 8;
-                    auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd_l2[tma_stage_idx])
-                                    + epilogue_wg_idx * STORE_BLOCK_M * BLOCK_N * sizeof(cd_dtype_t)
-                                    + (warp_idx_in_wg / 2) * STORE_BLOCK_M * kSwizzleCDMode
-                                    + i * ATOM_M * kSwizzleCDMode
-                                    + row * (kNumBankGroupBytes * 8)
-                                    + (col ^ row) * kNumBankGroupBytes;
-                    ptx::SM90_U32x4_STSM_T<uint32_t>::copy(
-                        math::cast_into_bf16_and_pack(values[0], values[1]),
-                        math::cast_into_bf16_and_pack(values[2], values[3]),
-                        math::cast_into_bf16_and_pack(values[4], values[5]),
-                        math::cast_into_bf16_and_pack(values[6], values[7]),
-                        smem_ptr);
-                }
-
-                ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
-
-                if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                    uint32_t out_n_idx = global_n_tile * BLOCK_N;
-                    uint32_t out_m_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M;
-                    cute::tma_store_fence();
-                    cute::SM90_TMA_STORE_2D::copy(
-                        &tensor_map_y,
-                        reinterpret_cast<uint8_t*>(smem_cd_l2[tma_stage_idx])
-                            + epilogue_wg_idx * STORE_BLOCK_M * BLOCK_N * sizeof(cd_dtype_t),
-                        out_n_idx, out_m_idx);
-                    cute::tma_store_arrive();
-                }
-                __syncwarp();
+            for (uint32_t i = 0; i < kL2AtomsPerTile; ++ i) {
+                auto* v = &values[i * ATOM_N];
+                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_base + i * ATOM_N,
+                    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
             }
+            cutlass::arch::fence_view_async_tmem_load();
+
+            ptx::tcgen05_before_thread_sync();
+            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+
+            // Phase 2: SMEM 写双缓冲等待
+            const uint32_t tma_stage_idx = tma_stage_idx_l2;
+            ptx::tma_store_wait<kNumTMAStoreStages - 1>();
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+            // Phase 3: cast fp32 -> BF16, 写 SMEM (每 lane 1 row × 128 cols × 2B = 256B)
+            auto smem_cd_base = reinterpret_cast<uint8_t*>(smem_cd_l2[tma_stage_idx]);
+            if (m_row < valid_m) {
+                auto dst = smem_cd_base + m_row * BLOCK_N * sizeof(cd_dtype_t);
+                #pragma unroll
+                for (uint32_t i = 0; i < kL2AtomsPerTile; ++ i) {
+                    auto* v = &values[i * ATOM_N];
+                    // 每 2 个 fp32 → 1 个 uint32 (2 个 BF16 打包)；8 个 fp32 → 4 个 uint32 = 1 次 v4.u32
+                    const uint32_t p0 = math::cast_into_bf16_and_pack(v[0], v[1]);
+                    const uint32_t p1 = math::cast_into_bf16_and_pack(v[2], v[3]);
+                    const uint32_t p2 = math::cast_into_bf16_and_pack(v[4], v[5]);
+                    const uint32_t p3 = math::cast_into_bf16_and_pack(v[6], v[7]);
+                    auto row_dst = dst + i * ATOM_N * sizeof(cd_dtype_t);
+                    ptx::st_shared(row_dst, p0, p1, p2, p3);
+                }
+            }
+
+            cute::tma_store_fence();
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+            if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                const uint32_t out_n_idx = global_n_tile * BLOCK_N;
+                const uint32_t out_m_idx = 0;
+                cute::SM90_TMA_STORE_2D::copy(
+                    &tensor_map_y,
+                    smem_cd_base,
+                    out_n_idx, out_m_idx);
+                cute::tma_store_arrive();
+            }
+            __syncwarp();
             tma_stage_idx_l2 = (tma_stage_idx_l2 + 1) % kNumTMAStoreStages;
         }
 
