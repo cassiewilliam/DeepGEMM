@@ -45,6 +45,8 @@ echo "[build_mega_ffn] REPO_ROOT   = ${REPO_ROOT}"
 
 OUT="${SCRIPT_DIR}/test_mega_ffn"
 SRC="${SCRIPT_DIR}/test_sm100_fp8_mega_ffn.cu"
+OUT_BASELINE="${SCRIPT_DIR}/test_mega_ffn_baseline"
+SRC_BASELINE="${SCRIPT_DIR}/test_mega_ffn_baseline.cu"
 
 INCS=(
     "-I${REPO_ROOT}/deep_gemm/include"
@@ -84,8 +86,22 @@ LIBS=(
     -lcudart
 )
 
+LIBS_BASELINE=(
+    "-L${CUDA_HOME}/lib64"
+    -lcuda
+    -lcudart
+    -lcublas
+)
+
 set -x
 "${NVCC}" "${FLAGS[@]}" "${INCS[@]}" "${SRC}" "${LIBS[@]}" -o "${OUT}"
 set +x
-
 echo "[build_mega_ffn] built: ${OUT}"
+
+# baseline (optional; 设 SKIP_BASELINE=1 跳过)
+if [[ "${SKIP_BASELINE:-0}" != "1" ]] && [[ -f "${SRC_BASELINE}" ]]; then
+    set -x
+    "${NVCC}" "${FLAGS[@]}" "${INCS[@]}" "${SRC_BASELINE}" "${LIBS_BASELINE[@]}" -o "${OUT_BASELINE}"
+    set +x
+    echo "[build_mega_ffn] built: ${OUT_BASELINE}"
+fi
