@@ -183,20 +183,9 @@ sm100_fp8_mega_ffn_impl(
 
     // Linear1 跨 CTA N-split：gridDim.x == kL2OutputBlocksN，每 CTA 负责 kL1NPerCta 个 L1 N-tile。
     // 对 Qwen3-0.6B：48 / 8 = 6。每 CTA 只算 1/8 的 Linear1，消除原 8× 冗余。
-    // 当 MFFN_DISABLE_N_SPLIT==1 时回退为每 CTA 冗余计算全部 L1 tile（仅共享 workspace）。
     DG_STATIC_ASSERT(kL1OutputBlocksN % kL2OutputBlocksN == 0,
                      "L1 N-tile count must be divisible by L2 N-tile count for even split");
-#ifndef MFFN_DISABLE_N_SPLIT
-#define MFFN_DISABLE_N_SPLIT 0
-#endif
-#ifndef MFFN_DISABLE_GRID_SYNC
-#define MFFN_DISABLE_GRID_SYNC 0
-#endif
-#if MFFN_DISABLE_N_SPLIT
-    constexpr uint32_t kL1NPerCta         = kL1OutputBlocksN;
-#else
     constexpr uint32_t kL1NPerCta         = kL1OutputBlocksN / kL2OutputBlocksN; // e.g. 6
-#endif
 
     // -----------------------------------------------------------------------------
     // 坐标系 / 线程角色
@@ -211,12 +200,8 @@ sm100_fp8_mega_ffn_impl(
     // 简化：gridDim.x 必须能均分 kL2OutputBlocksN（host 端保证）
     const uint32_t kL2NPerCta = kL2OutputBlocksN / num_ctas > 0 ? kL2OutputBlocksN / num_ctas : 1;
 
-    // Linear1 本 CTA 负责的起始 N-tile（MFFN_DISABLE_N_SPLIT=1 时退化为 0）
-#if MFFN_DISABLE_N_SPLIT
-    const uint32_t kL1NStart = 0;
-#else
+    // Linear1 本 CTA 负责的起始 N-tile
     const uint32_t kL1NStart = cta_idx * kL1NPerCta;
-#endif
 
     // Prefetch 所有 TMA descriptor
     if (warp_idx == 0) {
@@ -351,7 +336,6 @@ sm100_fp8_mega_ffn_impl(
     // atomic spin 等待其他 CTA 完成，然后再 CTA-wide barrier 放行。
     auto grid_sync_l1_to_l2 = [&] () {
         ptx::sync_aligned(kNumThreads, kGridSyncBarrierIdx);
-#if MFFN_DISABLE_GRID_SYNC == 0
         if (thread_idx == 0) {
             __threadfence();
             const uint32_t target = gridDim.x;
@@ -361,7 +345,6 @@ sm100_fp8_mega_ffn_impl(
             }
         }
         ptx::sync_aligned(kNumThreads, kGridSyncBarrierIdx);
-#endif
     };
 
     // 寄存器预算
