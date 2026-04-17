@@ -360,16 +360,25 @@ sm100_fp8_mega_ffn_impl(
                     if (cute::elect_one_sync()) {
                         MFFN_TRACE("TMA-A pre copy A stage=%u kblk=%u ntile=%u desc_a=%p desc_sf=%p",
                                    stage_idx, k_block_idx, n_tile, tensor_map_a_ptr, tensor_map_a_sf_ptr);
-                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                            tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
-                            k_idx, m_idx, 1);
-                        MFFN_TRACE("TMA-A post copy A, pre copy SF stage=%u kblk=%u", stage_idx, k_block_idx);
-
-                        tma::copy<SF_BLOCK_M, 1, 0, uint32_t>(
-                            tensor_map_a_sf_ptr, full_barriers[stage_idx],
-                            smem_sfa[stage_idx],
-                            sfa_m_idx, sfa_k128_idx, 1);
-                        MFFN_TRACE("TMA-A post copy SF stage=%u kblk=%u", stage_idx, k_block_idx);
+                        // Linear1: X 是 2D；Linear2: interm_load / interm_sf_load 是 3D（第 3 维=CTA 索引）
+                        if constexpr (phase_tag == Phase::Linear1) {
+                            tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, false>(
+                                tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
+                                k_idx, m_idx, 1);
+                            tma::copy<SF_BLOCK_M, 1, 0, uint32_t, false>(
+                                tensor_map_a_sf_ptr, full_barriers[stage_idx],
+                                smem_sfa[stage_idx],
+                                sfa_m_idx, sfa_k128_idx, 1);
+                        } else {
+                            tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, true>(
+                                tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
+                                k_idx, m_idx, 1, cta_idx);
+                            tma::copy<SF_BLOCK_M, 1, 0, uint32_t, true>(
+                                tensor_map_a_sf_ptr, full_barriers[stage_idx],
+                                smem_sfa[stage_idx],
+                                sfa_m_idx, sfa_k128_idx, 1, cta_idx);
+                        }
+                        MFFN_TRACE("TMA-A post copy A+SF stage=%u kblk=%u", stage_idx, k_block_idx);
 
                         uint32_t arrive_bytes = SMEM_A_SIZE_PER_STAGE + SF_BLOCK_M * sizeof(uint32_t);
                         full_barriers[stage_idx]->arrive_and_expect_tx(arrive_bytes);
@@ -416,15 +425,15 @@ sm100_fp8_mega_ffn_impl(
                     if (cute::elect_one_sync()) {
                         MFFN_TRACE("TMA-B pre copy B stage=%u kblk=%u ntile=%u desc_b=%p desc_sf=%p",
                                    stage_idx, k_block_idx, n_tile, tensor_map_b_ptr, tensor_map_b_sf_ptr);
-                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
+                        // W1/W2/W1_sf/W2_sf 都是 2D
+                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, false>(
                             tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx],
                             k_idx, n_idx, 1);
-                        MFFN_TRACE("TMA-B post copy B, pre copy SF stage=%u kblk=%u", stage_idx, k_block_idx);
-                        tma::copy<BLOCK_N, 1, 0, uint32_t>(
+                        tma::copy<BLOCK_N, 1, 0, uint32_t, false>(
                             tensor_map_b_sf_ptr, full_barriers[stage_idx],
                             smem_sfb[stage_idx],
                             sfb_n_idx, sfb_k128_idx, 1);
-                        MFFN_TRACE("TMA-B post copy SF stage=%u kblk=%u", stage_idx, k_block_idx);
+                        MFFN_TRACE("TMA-B post copy B+SF stage=%u kblk=%u", stage_idx, k_block_idx);
                         uint32_t arrive_bytes = SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(uint32_t);
                         full_barriers[stage_idx]->arrive_and_expect_tx(arrive_bytes);
                         MFFN_TRACE("TMA-B post arrive stage=%u kblk=%u", stage_idx, k_block_idx);
