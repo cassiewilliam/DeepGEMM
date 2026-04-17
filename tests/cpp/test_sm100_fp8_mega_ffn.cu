@@ -75,9 +75,14 @@
 // -----------------------------------------------------------------------------
 constexpr uint32_t kHidden       = 1024;
 constexpr uint32_t kIntermediate = 3072;
-constexpr uint32_t kMaxM         = 32;
+// kMaxM == BLOCK_M 作为 HBM padding，保证 TMA 在 M 方向读到合法地址；
+// runtime 有效 token 数由命令行参数 M 控制，epilogue 里按 valid_m 截断。
+constexpr uint32_t kMaxM         = 128;
 
-constexpr uint32_t BLOCK_M       = 32;
+// SM100 1-CTA MXF8F6F4 block-scaled UMMA 硬件要求 UMMA_M=128（CUTLASS static_assert M==128）。
+// 因此 BLOCK_M=128 是 SMEM/寄存器侧的物理 padding；kMaxM=32 是 runtime 的有效 token 上限，
+// epilogue 中按 valid_m 截断无效行（不会写出 HBM，也不会读到非法 SF）。
+constexpr uint32_t BLOCK_M       = 128;
 constexpr uint32_t BLOCK_N       = 128;
 constexpr uint32_t BLOCK_K       = 128;
 constexpr uint32_t kNumStages    = 3;
@@ -93,7 +98,8 @@ constexpr uint32_t kGranK = 32;
 // -----------------------------------------------------------------------------
 // TensorMap 构造 helper
 // -----------------------------------------------------------------------------
-static CUtensorMap make_tma_2d(void* gmem_ptr,
+static CUtensorMap make_tma_2d(const char* name,
+                               void* gmem_ptr,
                                CUtensorMapDataType dtype,
                                uint64_t gmem_inner, uint64_t gmem_outer,
                                uint32_t smem_inner, uint32_t smem_outer,
@@ -105,14 +111,25 @@ static CUtensorMap make_tma_2d(void* gmem_ptr,
     cuuint32_t box[2]     = {smem_inner, smem_outer};
     cuuint32_t elem_str[2]= {1, 1};
 
-    DRV_CHECK(cuTensorMapEncodeTiled(
+    std::fprintf(stderr,
+        "[TMA-2D %s] dims=(%llu,%llu) box=(%u,%u) stride1=%llu swizzle=%d ptr=%p\n",
+        name, (unsigned long long)dims[0], (unsigned long long)dims[1],
+        box[0], box[1], (unsigned long long)strides[0], (int)swizzle, gmem_ptr);
+
+    CUresult _r = cuTensorMapEncodeTiled(
         &tm, dtype, 2, gmem_ptr, dims, strides, box, elem_str,
         CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (_r != CUDA_SUCCESS) {
+        const char* msg = nullptr; cuGetErrorString(_r, &msg);
+        std::fprintf(stderr, "[TMA-2D %s] FAILED: %s\n", name, msg ? msg : "(null)");
+        std::exit(1);
+    }
     return tm;
 }
 
-static CUtensorMap make_tma_3d(void* gmem_ptr,
+static CUtensorMap make_tma_3d(const char* name,
+                               void* gmem_ptr,
                                CUtensorMapDataType dtype,
                                uint64_t dim0, uint64_t dim1, uint64_t dim2,
                                uint32_t box0, uint32_t box1, uint32_t box2,
@@ -124,10 +141,22 @@ static CUtensorMap make_tma_3d(void* gmem_ptr,
     cuuint32_t box[3]     = {box0, box1, box2};
     cuuint32_t elem_str[3]= {1, 1, 1};
 
-    DRV_CHECK(cuTensorMapEncodeTiled(
+    std::fprintf(stderr,
+        "[TMA-3D %s] dims=(%llu,%llu,%llu) box=(%u,%u,%u) stride=(%llu,%llu) swizzle=%d ptr=%p\n",
+        name,
+        (unsigned long long)dims[0], (unsigned long long)dims[1], (unsigned long long)dims[2],
+        box[0], box[1], box[2],
+        (unsigned long long)strides[0], (unsigned long long)strides[1], (int)swizzle, gmem_ptr);
+
+    CUresult _r = cuTensorMapEncodeTiled(
         &tm, dtype, 3, gmem_ptr, dims, strides, box, elem_str,
         CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (_r != CUDA_SUCCESS) {
+        const char* msg = nullptr; cuGetErrorString(_r, &msg);
+        std::fprintf(stderr, "[TMA-3D %s] FAILED: %s\n", name, msg ? msg : "(null)");
+        std::exit(1);
+    }
     return tm;
 }
 
@@ -162,6 +191,26 @@ static inline uint8_t float_to_ue8m0_ceil(float x) {
     if (man != 0) exp += 1;
     if (exp > 0xff) exp = 0xff;
     return static_cast<uint8_t>(exp);
+}
+
+// Host-side：将 M-major uint8 SF `[rows][cols/32]` 转成 K-major uint32
+// `[cols/128][rows]`，每个 uint32 打包 4 个沿 K 方向连续的 UE8M0 字节。
+// 这是 SM100 block-scaled UMMA 的标准布局，TMA inner=rows 维度 ≥ 16B。
+static std::vector<uint32_t> sf_to_kmajor_uint32(const std::vector<uint8_t>& sf_mmajor,
+                                                 uint32_t rows, uint32_t cols) {
+    const uint32_t kK4 = cols / 128;            // 每 4 个 32-element K-chunk 打成 1 uint32
+    std::vector<uint32_t> out(static_cast<size_t>(kK4) * rows, 0u);
+    for (uint32_t r = 0; r < rows; ++ r) {
+        for (uint32_t k4 = 0; k4 < kK4; ++ k4) {
+            uint32_t packed = 0;
+            for (uint32_t t = 0; t < 4; ++ t) {
+                uint8_t v = sf_mmajor[r * (cols / kGranK) + k4 * 4 + t];
+                packed |= static_cast<uint32_t>(v) << (t * 8);
+            }
+            out[static_cast<size_t>(k4) * rows + r] = packed;
+        }
+    }
+    return out;
 }
 
 // 把 BF16 序列量化为 FP8 + UE8M0 scale（每 32 个元素一个 scale）
@@ -260,7 +309,7 @@ static void cpu_reference_ffn(
 // 主函数：构造数据、TensorMap、发起 cluster launch、校验
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv) {
-    uint32_t M          = argc > 1 ? static_cast<uint32_t>(std::atoi(argv[1])) : 32;
+    uint32_t M          = argc > 1 ? static_cast<uint32_t>(std::atoi(argv[1])) : 1;
     uint32_t num_iters  = argc > 2 ? static_cast<uint32_t>(std::atoi(argv[2])) : 50;
 
     if (M == 0 or M > kMaxM) {
@@ -320,91 +369,101 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_ws_sf, bytes_ws_sf));
 
     CUDA_CHECK(cudaMemcpy(d_x,     x_fp8.data(),  bytes_x,  cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_x_sf,  x_sf.data(),   bytes_xs, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_w1,    w1_fp8.data(), bytes_w1, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_w1_sf, w1_sf.data(),  bytes_w1s,cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_w2,    w2_fp8.data(), bytes_w2, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_w2_sf, w2_sf.data(),  bytes_w2s,cudaMemcpyHostToDevice));
+
+    // SF: host 量化出的是 M-major uint8，UMMA + TMA 需要 K-major uint32。
+    //   X_sf:  [kMaxM, H/32]  →  [H/128, kMaxM]   uint32
+    //   W1_sf: [2I, H/32]     →  [H/128, 2I]      uint32
+    //   W2_sf: [H, I/32]      →  [I/128, H]       uint32
+    auto x_sf_km  = sf_to_kmajor_uint32(x_sf,  kMaxM,              kHidden);
+    auto w1_sf_km = sf_to_kmajor_uint32(w1_sf, 2 * kIntermediate,  kHidden);
+    auto w2_sf_km = sf_to_kmajor_uint32(w2_sf, kHidden,            kIntermediate);
+    CUDA_CHECK(cudaMemcpy(d_x_sf,  x_sf_km.data(),  bytes_xs, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w1_sf, w1_sf_km.data(), bytes_w1s,cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w2_sf, w2_sf_km.data(), bytes_w2s,cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_y, 0, bytes_y));
     CUDA_CHECK(cudaMemset(d_ws, 0, bytes_ws));
     CUDA_CHECK(cudaMemset(d_ws_sf, 0, bytes_ws_sf));
 
     // --- Build CUtensorMap descriptors ---
     // X: [M, H] FP8, swizzle 128B (BLOCK_K bytes)
-    auto tma_x = make_tma_2d(d_x, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+    auto tma_x = make_tma_2d("X", d_x, CU_TENSOR_MAP_DATA_TYPE_UINT8,
                              kHidden, kMaxM,
                              BLOCK_K, BLOCK_M,
                              static_cast<uint64_t>(kHidden) * 1,
                              CU_TENSOR_MAP_SWIZZLE_128B);
-    // X_sf: inner=M (SF_BLOCK_M=128), outer=H/128 (uint32 rows)
-    // 由于 BLOCK_M <= SF_BLOCK_M（128），此 TMA 的 inner box 是 SF_BLOCK_M=128
-    auto tma_x_sf = make_tma_2d(d_x_sf, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                kMaxM, kHidden / kGranK,
+    // X_sf: K-major uint32 布局 [H/128, M] —— inner=M (连续 ≥16B 满足 TMA), outer=K/128。
+    // 每次 TMA 读一个 k128 列的 SF_BLOCK_M=128 tokens，共 128 × 4 = 512 字节。
+    auto tma_x_sf = make_tma_2d("X_sf", d_x_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                                kMaxM, kHidden / 128,
                                 128, 1,
-                                static_cast<uint64_t>(kMaxM));
+                                static_cast<uint64_t>(kMaxM) * sizeof(uint32_t));
 
     // W1: [2I, H] FP8
-    auto tma_w1 = make_tma_2d(d_w1, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+    auto tma_w1 = make_tma_2d("W1", d_w1, CU_TENSOR_MAP_DATA_TYPE_UINT8,
                               kHidden, 2 * kIntermediate,
                               BLOCK_K, BLOCK_N,
                               static_cast<uint64_t>(kHidden),
                               CU_TENSOR_MAP_SWIZZLE_128B);
-    auto tma_w1_sf = make_tma_2d(d_w1_sf, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                 2 * kIntermediate, kHidden / kGranK,
+    // W1_sf: K-major uint32 布局 [H/128, 2I] —— inner=2I, outer=K/128。
+    //   每次 TMA 读一个 k128 列的 BLOCK_N 行，共 BLOCK_N × 4 = 512 字节。
+    auto tma_w1_sf = make_tma_2d("W1_sf", d_w1_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                                 2 * kIntermediate, kHidden / 128,
                                  BLOCK_N, 1,
-                                 static_cast<uint64_t>(2 * kIntermediate));
+                                 static_cast<uint64_t>(2 * kIntermediate) * sizeof(uint32_t));
 
     // W2: [H, I] FP8
-    auto tma_w2 = make_tma_2d(d_w2, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+    auto tma_w2 = make_tma_2d("W2", d_w2, CU_TENSOR_MAP_DATA_TYPE_UINT8,
                               kIntermediate, kHidden,
                               BLOCK_K, BLOCK_N,
                               static_cast<uint64_t>(kIntermediate),
                               CU_TENSOR_MAP_SWIZZLE_128B);
-    auto tma_w2_sf = make_tma_2d(d_w2_sf, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                 kHidden, kIntermediate / kGranK,
+    // W2_sf: K-major uint32 布局 [I/128, H] —— inner=H, outer=I/128。
+    auto tma_w2_sf = make_tma_2d("W2_sf", d_w2_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                                 kHidden, kIntermediate / 128,
                                  BLOCK_N, 1,
-                                 static_cast<uint64_t>(kHidden));
+                                 static_cast<uint64_t>(kHidden) * sizeof(uint32_t));
 
     // workspace intermediate FP8 [num_ctas, kMaxM, kIntermediate]
     //   写入视图 (SM90_TMA_STORE_3D)：inner=I, outer=M, batch=cta_idx
     //   tile  = (L1_OUT_BLOCK_N, BLOCK_M, 1) -- 但 TMA store 固定 box = (L1_OUT_BLOCK_N, STORE_BLOCK_M)
-    auto tma_interm = make_tma_3d(d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+    auto tma_interm = make_tma_3d("interm_w", d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
                                   kIntermediate, kMaxM, kNumCTAs,
                                   BLOCK_N / 2, BLOCK_M, 1,
                                   static_cast<uint64_t>(kIntermediate),
                                   static_cast<uint64_t>(kMaxM) * kIntermediate,
                                   CU_TENSOR_MAP_SWIZZLE_64B);
     // 读视图：给 Linear2 TMA-A 用，box = (BLOCK_K, BLOCK_M)
-    // TMA-A 在 Linear2 中使用 2D 版本（cta_idx 在 kernel 侧通过 load 位置 + 基址偏置处理）
-    // 为了让 TMA 一次就能切换 cta slice，我们对 interm_load 直接构造 2D，指向
-    // 第 cta_idx 个 slice 的基址。由于 CTA 不同 slice 基址不同，需要 per-CTA 不同 descriptor，
-    // 这里我们用 3D descriptor + kernel 传 cta_idx 作为 batch。
-    auto tma_interm_load = make_tma_3d(d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+    auto tma_interm_load = make_tma_3d("interm_r", d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
                                        kIntermediate, kMaxM, kNumCTAs,
                                        BLOCK_K, BLOCK_M, 1,
                                        static_cast<uint64_t>(kIntermediate),
                                        static_cast<uint64_t>(kMaxM) * kIntermediate,
                                        CU_TENSOR_MAP_SWIZZLE_128B);
 
-    // workspace SF [num_ctas, kMaxM, kIntermediate/32]
-    auto tma_interm_sf = make_tma_3d(d_ws_sf, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                     kIntermediate / kGranK, kMaxM, kNumCTAs,
+    // workspace SF: K-major uint32 布局 [num_ctas, I/128, kMaxM]
+    //   写视图（当前 epilogue 走字节写，不经 TMA；保留 descriptor 仅作占位）
+    //   读视图：Linear2 TMA-A 的 SFA 源 —— inner=M, outer=I/128, batch=num_ctas
+    auto tma_interm_sf = make_tma_3d("interm_sf_w", d_ws_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                                     kMaxM, kIntermediate / 128, kNumCTAs,
                                      128, 1, 1,
-                                     static_cast<uint64_t>(kIntermediate / kGranK),
-                                     static_cast<uint64_t>(kMaxM) * (kIntermediate / kGranK));
-    // Linear2 读 SF 视图
-    auto tma_interm_sf_load = make_tma_3d(d_ws_sf, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                          kMaxM, kIntermediate / kGranK, kNumCTAs,
+                                     static_cast<uint64_t>(kMaxM) * sizeof(uint32_t),
+                                     static_cast<uint64_t>(kMaxM) * (kIntermediate / 128) * sizeof(uint32_t));
+    auto tma_interm_sf_load = make_tma_3d("interm_sf_r", d_ws_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                                          kMaxM, kIntermediate / 128, kNumCTAs,
                                           128, 1, 1,
-                                          static_cast<uint64_t>(kMaxM),
-                                          static_cast<uint64_t>(kMaxM) * (kIntermediate / kGranK));
+                                          static_cast<uint64_t>(kMaxM) * sizeof(uint32_t),
+                                          static_cast<uint64_t>(kMaxM) * (kIntermediate / 128) * sizeof(uint32_t));
 
-    // Y: [M, H] BF16
-    auto tma_y = make_tma_2d(d_y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+    // Y: [M, H] BF16 —— swizzle 128B 时 box[0]*2 必须 = 128 字节，故 box[0]=64.
+    // 当前 kernel epilogue 对 BLOCK_N=128 只发一次 TMA store，先用 SWIZZLE_NONE 跑通，
+    // 后续待与 epilogue STSM 对齐再切回 swizzle.
+    auto tma_y = make_tma_2d("Y", d_y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
                              kHidden, kMaxM,
                              BLOCK_N, BLOCK_M,
                              static_cast<uint64_t>(kHidden) * sizeof(nv_bfloat16),
-                             CU_TENSOR_MAP_SWIZZLE_128B);
+                             CU_TENSOR_MAP_SWIZZLE_NONE);
 
     // --- Kernel launch ---
     auto kernel = &deep_gemm::sm100_fp8_mega_ffn_impl<

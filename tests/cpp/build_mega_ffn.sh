@@ -53,19 +53,24 @@ INCS=(
 )
 
 # sm_100a: Blackwell B200 feature set (UMMA / TMEM / cluster-3 / ...)
+# 注意：CUDA 13 必须用 -gencode 指定 arch-specific 后缀 100a，否则 ptxas
+# 会以 sm_100 target 解析，导致 tcgen05.* / cta_group::1 / mxf8f6f4 等指令报错。
 FLAGS=(
     -std=c++17
     -O3
-    -arch=sm_100a
+    -gencode=arch=compute_100a,code=sm_100a
     -Xcompiler=-fPIC
     -Xcompiler=-Wno-psabi
     --expt-relaxed-constexpr
     --expt-extended-lambda
     -DCUTE_USE_PACKED_TUPLE=1
     -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1
-    # 避免编译器过度限制 register 使用
-    --maxrregcount=255
 )
+
+# 允许通过 TRACE=1 ./build_mega_ffn.sh 打开 kernel 内 printf 调试
+if [[ "${TRACE:-0}" == "1" ]]; then
+    FLAGS+=(-DMEGA_FFN_TRACE=1)
+fi
 
 LIBS=(
     "-L${CUDA_HOME}/lib64"

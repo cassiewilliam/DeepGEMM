@@ -37,6 +37,7 @@
 // =====================================================================================
 
 #include <cstdint>
+#include <type_traits>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cute/arch/tmem_allocator_sm100.hpp>
@@ -51,6 +52,23 @@
 #include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm {
+
+// -------------------------------------------------------------------------------------
+// Debug trace switch. 编译时加 -DMEGA_FFN_TRACE=1 打开；默认关。
+// 只在 cta_idx==0 && lane 0 时打印，尽量减少 printf 开销 & divergence.
+// -------------------------------------------------------------------------------------
+#ifndef MEGA_FFN_TRACE
+#define MEGA_FFN_TRACE 0
+#endif
+#if MEGA_FFN_TRACE
+#define MFFN_TRACE(fmt, ...) do {                                   \
+    if (blockIdx.x == 0 && threadIdx.x % 32 == 0)                   \
+        printf("[cta%u w%u] " fmt "\n", blockIdx.x,                 \
+               threadIdx.x / 32, ##__VA_ARGS__);                    \
+} while(0)
+#else
+#define MFFN_TRACE(...) ((void)0)
+#endif
 
 // -------------------------------------------------------------------------------------
 // 模板参数：
@@ -74,7 +92,6 @@ template <
     uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kClusterDim    = 1,
-    float    kActivationClamp = cute::numeric_limits<float>::infinity(),
     bool     kFastMath      = true,
     // Derived constants
     uint32_t kNumThreads    = kNumNonEpilogueThreads + kNumEpilogueThreads,
@@ -110,10 +127,12 @@ sm100_fp8_mega_ffn_impl(
     DG_STATIC_ASSERT(kHidden        % BLOCK_N == 0, "Hidden must be divisible by BLOCK_N");
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only BLOCK_K=128 is supported (matches 128B swizzle)");
     DG_STATIC_ASSERT(BLOCK_N == 128, "Only BLOCK_N=128 is supported");
-    DG_STATIC_ASSERT(BLOCK_M == 32 or BLOCK_M == 64, "BLOCK_M must be 32 or 64");
+    // SM100 1-CTA MXF8F6F4 block-scaled UMMA 硬件要求 UMMA_M == 128，因此 BLOCK_M 必须 128。
+    // kMaxM 可以 <= 32（decoding 典型值），epilogue 中按 valid_m 截断无效行。
+    DG_STATIC_ASSERT(BLOCK_M == 128, "BLOCK_M must be 128 (UMMA_M=128 for 1-CTA MXF8F6F4)");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Must be 128 (TMA-A/B/MMA/cold)");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Epilogue threads must be multiple of 128");
-    DG_STATIC_ASSERT(kMaxM <= 64, "kMaxM constrained by UMMA_M padding");
+    DG_STATIC_ASSERT(kMaxM <= 128, "kMaxM constrained by UMMA_M padding");
     DG_STATIC_ASSERT(kNumStages >= 2, "Need at least 2 pipeline stages");
 
     using a_dtype_t  = cutlass::float_e4m3_t;    // activation (X / intermediate)
@@ -122,8 +141,10 @@ sm100_fp8_mega_ffn_impl(
     using cd_dtype_t = cutlass::bfloat16_t;      // output
 
     // UMMA 形状（1-CTA，无 A/B swap）
-    // UMMA_M 必须是 64/128/256，使用 64 承载 kMaxM <= 32 的 padding
-    constexpr uint32_t UMMA_M = 64;
+    // SM100 1-CTA MXF8F6F4 block-scaled UMMA 仅支持 UMMA_M=128（CUTLASS static_assert）。
+    // 对于 kMaxM≤32 decoding，M-方向会有 ~3/4 冗余，但 hardware 限制无法规避；
+    // epilogue 按 valid_m 截断，不会写出多余行。
+    constexpr uint32_t UMMA_M = 128;
     constexpr uint32_t UMMA_N = BLOCK_N;
     constexpr uint32_t UMMA_K = 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M;
@@ -278,6 +299,7 @@ sm100_fp8_mega_ffn_impl(
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     __syncthreads();
+    MFFN_TRACE("post-init syncthreads passed");
 
     // -----------------------------------------------------------------------------
     // K-pipeline 游标（TMA 生产者 / MMA 消费者共用）
@@ -311,31 +333,39 @@ sm100_fp8_mega_ffn_impl(
     // -------------------------------------------------------------------------
     if (warp_idx == 0) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        MFFN_TRACE("TMA-A enter");
 
-        auto tma_a_loop = [&](Phase phase_tag, uint32_t num_n_blocks, uint32_t n_base) {
-            const auto& tensor_map_a    = (phase_tag == Phase::Linear1) ? tensor_map_x      : tensor_map_interm_load;
-            const auto& tensor_map_a_sf = (phase_tag == Phase::Linear1) ? tensor_map_x_sf   : tensor_map_interm_sf_load;
-            const uint32_t num_k_blocks = (phase_tag == Phase::Linear1) ? kL1KBlocks        : kL2KBlocks;
-            const uint32_t m_idx = 0;  // all tokens occupy [0, BLOCK_M)
+        // 注意：不能用 `const auto& d = cond ? ... : ...` 去绑定 `__grid_constant__` 的
+        // TmaDescriptor 参数，nvcc 会把 `&d` 常量折叠成 0x0（null）导致 UTMALDG 非法指令。
+        // 因此 Phase 用模板常量，descriptor 直接显式传入。
+        auto tma_a_loop = [&](auto phase_tag_c,
+                              const cute::TmaDescriptor* tensor_map_a_ptr,
+                              const cute::TmaDescriptor* tensor_map_a_sf_ptr,
+                              uint32_t num_n_blocks, uint32_t /*n_base*/) {
+            constexpr Phase phase_tag = decltype(phase_tag_c)::value;
+            MFFN_TRACE("TMA-A loop phase=%d n_blocks=%u", (int)phase_tag, num_n_blocks);
+            constexpr uint32_t num_k_blocks = (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocks;
+            const uint32_t m_idx = 0;
 
             for (uint32_t n_tile = 0; n_tile < num_n_blocks; ++ n_tile) {
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    MFFN_TRACE("TMA-A pre-empty_wait stage=%u phase=%u kblk=%u ntile=%u", stage_idx, phase, k_block_idx, n_tile);
                     empty_barriers[stage_idx]->wait(phase ^ 1);
+                    MFFN_TRACE("TMA-A post-empty_wait stage=%u phase=%u kblk=%u", stage_idx, phase, k_block_idx);
 
                     uint32_t k_idx    = k_block_idx * BLOCK_K;
-                    uint32_t sfa_k_idx = k_block_idx;
-                    uint32_t sfa_m_idx = 0;
+                    uint32_t sfa_m_idx    = 0;
+                    uint32_t sfa_k128_idx = k_block_idx;
 
                     if (cute::elect_one_sync()) {
-                        // activation (FP8) — 2D TMA (inner=K, outer=M)
                         tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                            &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx],
+                            tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
                             k_idx, m_idx, 1);
 
-                        // SFA — inner=M (SF_BLOCK_M), outer=k index (每 4 个 K-block 一列 uint32)
-                        tma::copy<SF_BLOCK_M, 1, 0>(
-                            &tensor_map_a_sf, full_barriers[stage_idx], smem_sfa[stage_idx],
-                            sfa_m_idx, sfa_k_idx, 1);
+                        tma::copy<SF_BLOCK_M, 1, 0, uint32_t>(
+                            tensor_map_a_sf_ptr, full_barriers[stage_idx],
+                            smem_sfa[stage_idx],
+                            sfa_m_idx, sfa_k128_idx, 1);
 
                         uint32_t arrive_bytes = SMEM_A_SIZE_PER_STAGE + SF_BLOCK_M * sizeof(uint32_t);
                         full_barriers[stage_idx]->arrive_and_expect_tx(arrive_bytes);
@@ -345,38 +375,47 @@ sm100_fp8_mega_ffn_impl(
             }
         };
 
-        // --- Phase Linear1 ---
-        tma_a_loop(Phase::Linear1, kL1OutputBlocksN, 0);
-        // --- Phase Linear2 ---
-        tma_a_loop(Phase::Linear2, kL2NPerCta, 0);
+        tma_a_loop(std::integral_constant<Phase, Phase::Linear1>{},
+                   &tensor_map_x, &tensor_map_x_sf,
+                   kL1OutputBlocksN, 0);
+        tma_a_loop(std::integral_constant<Phase, Phase::Linear2>{},
+                   &tensor_map_interm_load, &tensor_map_interm_sf_load,
+                   kL2NPerCta, 0);
 
     // =========================================================================
     // 角色 ②：TMA-B warp —— 负责 B-tile (W1 / W2) + SFB
     // -------------------------------------------------------------------------
     } else if (warp_idx == 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        MFFN_TRACE("TMA-B enter");
 
-        auto tma_b_loop = [&](Phase phase_tag, uint32_t num_n_blocks, uint32_t n_base) {
-            const auto& tensor_map_b    = (phase_tag == Phase::Linear1) ? tensor_map_w1    : tensor_map_w2;
-            const auto& tensor_map_b_sf = (phase_tag == Phase::Linear1) ? tensor_map_w1_sf : tensor_map_w2_sf;
-            const uint32_t num_k_blocks = (phase_tag == Phase::Linear1) ? kL1KBlocks       : kL2KBlocks;
+        auto tma_b_loop = [&](auto phase_tag_c,
+                              const cute::TmaDescriptor* tensor_map_b_ptr,
+                              const cute::TmaDescriptor* tensor_map_b_sf_ptr,
+                              uint32_t num_n_blocks, uint32_t n_base) {
+            constexpr Phase phase_tag = decltype(phase_tag_c)::value;
+            MFFN_TRACE("TMA-B loop phase=%d n_blocks=%u", (int)phase_tag, num_n_blocks);
+            constexpr uint32_t num_k_blocks = (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocks;
 
             for (uint32_t n_tile = 0; n_tile < num_n_blocks; ++ n_tile) {
                 const uint32_t n_idx = (n_base + n_tile) * BLOCK_N;
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    MFFN_TRACE("TMA-B pre-empty_wait stage=%u phase=%u kblk=%u ntile=%u", stage_idx, phase, k_block_idx, n_tile);
                     empty_barriers[stage_idx]->wait(phase ^ 1);
+                    MFFN_TRACE("TMA-B post-empty_wait stage=%u phase=%u kblk=%u", stage_idx, phase, k_block_idx);
 
                     uint32_t k_idx     = k_block_idx * BLOCK_K;
-                    uint32_t sfb_n_idx = n_idx;
-                    uint32_t sfb_k_idx = k_block_idx;
+                    uint32_t sfb_n_idx    = n_idx;
+                    uint32_t sfb_k128_idx = k_block_idx;
 
                     if (cute::elect_one_sync()) {
                         tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
-                            &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx],
+                            tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx],
                             k_idx, n_idx, 1);
-                        tma::copy<BLOCK_N, 1, 0>(
-                            &tensor_map_b_sf, full_barriers[stage_idx], smem_sfb[stage_idx],
-                            sfb_n_idx, sfb_k_idx, 1);
+                        tma::copy<BLOCK_N, 1, 0, uint32_t>(
+                            tensor_map_b_sf_ptr, full_barriers[stage_idx],
+                            smem_sfb[stage_idx],
+                            sfb_n_idx, sfb_k128_idx, 1);
                         uint32_t arrive_bytes = SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(uint32_t);
                         full_barriers[stage_idx]->arrive_and_expect_tx(arrive_bytes);
                     }
@@ -385,14 +424,19 @@ sm100_fp8_mega_ffn_impl(
             }
         };
 
-        tma_b_loop(Phase::Linear1, kL1OutputBlocksN, 0);
-        tma_b_loop(Phase::Linear2, kL2NPerCta, cta_idx * kL2NPerCta);
+        tma_b_loop(std::integral_constant<Phase, Phase::Linear1>{},
+                   &tensor_map_w1, &tensor_map_w1_sf,
+                   kL1OutputBlocksN, 0);
+        tma_b_loop(std::integral_constant<Phase, Phase::Linear2>{},
+                   &tensor_map_w2, &tensor_map_w2_sf,
+                   kL2NPerCta, cta_idx * kL2NPerCta);
 
     // =========================================================================
     // 角色 ③：MMA warp —— 发 UMMA 指令、UTCCP SF、commit barrier
     // -------------------------------------------------------------------------
     } else if (warp_idx == 2) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        MFFN_TRACE("MMA enter");
 
         // UMMA block-scaled 指令描述符（FP8×FP8，UE8M0 scale）
         auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
@@ -418,14 +462,33 @@ sm100_fp8_mega_ffn_impl(
         };
         (void)mma_loop;  // silence unused
 
+        // UTCCP 需要的 SMEM 转置：
+        //   TMA 把 SF 加载到 SMEM 后，按 K-major uint32 `[k128][m]` 排布。
+        //   UTCCP 4x32dp128bit 期望的 SMEM 序是 4×32 转置 + XOR-swizzle。
+        //   此 lambda 必须由整个 warp (32 lanes) 一起执行。
+        auto utccp_smem_transpose = [&](uint32_t* smem_ptr) {
+            uint32_t values[4];
+            #pragma unroll
+            for (uint32_t i = 0; i < 4; ++ i)
+                values[i] = ptx::ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
+            __syncwarp();
+            #pragma unroll
+            for (uint32_t i = 0; i < 4; ++ i)
+                ptx::st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
+        };
+
         auto run_mma = [&](Phase phase_tag, uint32_t num_n_blocks) {
+            MFFN_TRACE("MMA loop phase=%d n_blocks=%u", (int)phase_tag, num_n_blocks);
             const uint32_t num_k_blocks = (phase_tag == Phase::Linear1) ? kL1KBlocks : kL2KBlocks;
             for (uint32_t n_tile = 0; n_tile < num_n_blocks; ++ n_tile) {
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
                 const auto accum_phase     = (current_iter_idx / kNumEpilogueStages) & 1;
                 ++ current_iter_idx;
 
+                MFFN_TRACE("MMA ENTER ntile=%u iter=%u acc_stage=%u acc_phase=%u stage_idx=%u phase=%u",
+                           n_tile, current_iter_idx-1, accum_stage_idx, accum_phase, stage_idx, phase);
                 tmem_empty_barriers[accum_stage_idx]->wait(accum_phase ^ 1);
+                MFFN_TRACE("MMA post tmem_empty_wait iter=%u", current_iter_idx-1);
                 ptx::tcgen05_after_thread_sync();
 
                 auto empty_arrive = [&](bool do_tmem_full) {
@@ -436,14 +499,28 @@ sm100_fp8_mega_ffn_impl(
                 };
 
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    MFFN_TRACE("MMA pre full_wait stage=%u phase=%u kblk=%u", stage_idx, phase, k_block_idx);
                     full_barriers[stage_idx]->wait(phase);
+                    MFFN_TRACE("MMA post full_wait stage=%u phase=%u kblk=%u", stage_idx, phase, k_block_idx);
                     ptx::tcgen05_after_thread_sync();
+
+                    // 所有 32 lanes 协作：把 K-major SF SMEM 转置成 UTCCP 期望的 layout
+                    #pragma unroll
+                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
+                        utccp_smem_transpose(smem_sfa[stage_idx] + i * kNumUTCCPAlignedElems);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
+                        utccp_smem_transpose(smem_sfb[stage_idx] + i * kNumUTCCPAlignedElems);
+                    cutlass::arch::fence_view_async_shared();
+                    __syncwarp();
 
                     const auto a_base_lo = ptx::exchange(a_desc_lo, stage_idx);
                     const auto b_base_lo = ptx::exchange(b_desc_lo, stage_idx);
+                    MFFN_TRACE("MMA post exchange kblk=%u a_lo=%x b_lo=%x", k_block_idx, a_base_lo, b_base_lo);
 
                     if (cute::elect_one_sync()) {
                         // UTCCP: SMEM → TMEM scale factor copies
+                        MFFN_TRACE("MMA pre UTCCP kblk=%u stage=%u", k_block_idx, stage_idx);
                         using cute_utccp_t = cute::SM100_UTCCP_4x32dp128bit_1cta;
                         #pragma unroll
                         for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
@@ -457,6 +534,7 @@ sm100_fp8_mega_ffn_impl(
                             mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
                             cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                         }
+                        MFFN_TRACE("MMA post UTCCP kblk=%u", k_block_idx);
 
                         // K 方向展开 (BLOCK_K / UMMA_K 次 MMA)
                         #pragma unroll
@@ -467,18 +545,26 @@ sm100_fp8_mega_ffn_impl(
                                 cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_base_lo, 0, k * UMMA_K);
                             b_desc.lo = mma::sm100::advance_umma_desc_lo<
                                 cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_base_lo, 0, k * UMMA_K);
+                            MFFN_TRACE("MMA pre fma kblk=%u k=%u scaleC=%d tmem=%u",
+                                       k_block_idx, k, int(k_block_idx > 0 or k > 0),
+                                       accum_stage_idx * UMMA_N);
                             ptx::SM100_MMA_MXF8F6F4_SS::fma(
                                 a_desc, b_desc,
                                 accum_stage_idx * UMMA_N,
                                 k_block_idx > 0 or k > 0,
                                 runtime_desc,
                                 kTmemStartColOfSFA, kTmemStartColOfSFB);
+                            MFFN_TRACE("MMA post fma kblk=%u k=%u", k_block_idx, k);
                         }
                     }
                     __syncwarp();
+                    MFFN_TRACE("MMA pre empty_arrive kblk=%u last=%d", k_block_idx, int(k_block_idx == num_k_blocks - 1));
                     empty_arrive(k_block_idx == num_k_blocks - 1);
+                    MFFN_TRACE("MMA post empty_arrive kblk=%u", k_block_idx);
                 }
+                MFFN_TRACE("MMA exit kblk loop ntile=%u", n_tile);
             }
+            MFFN_TRACE("MMA exit ntile loop phase=%d", (int)phase_tag);
         };
 
         run_mma(Phase::Linear1, kL1OutputBlocksN);
@@ -501,6 +587,7 @@ sm100_fp8_mega_ffn_impl(
     // -------------------------------------------------------------------------
     } else {
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
+        MFFN_TRACE("EPI enter warp=%u", warp_idx);
 
         DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
 
@@ -541,12 +628,15 @@ sm100_fp8_mega_ffn_impl(
 
         // --- Linear1 epilogue loop ---
         uint32_t tma_stage_idx_l1 = 0;
+        MFFN_TRACE("EPI L1 loop start n_blocks=%u", kL1OutputBlocksN);
         for (uint32_t n_tile = 0; n_tile < kL1OutputBlocksN; ++ n_tile) {
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase     = (current_iter_idx / kNumEpilogueStages) & 1;
             ++ current_iter_idx;
 
+            MFFN_TRACE("EPI L1 pre tmem_full_wait iter=%u acc_stage=%u acc_phase=%u ntile=%u", current_iter_idx-1, accum_stage_idx, accum_phase, n_tile);
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
+            MFFN_TRACE("EPI L1 post tmem_full_wait iter=%u ntile=%u", current_iter_idx-1, n_tile);
             ptx::tcgen05_after_thread_sync();
 
             const uint32_t valid_m = num_tokens;
@@ -595,12 +685,6 @@ sm100_fp8_mega_ffn_impl(
                     for (uint32_t k = 0; k < 2; ++ k) {
                         auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k*4 + 0], fp32_values[k*4 + 1]));
                         auto bf16_up   = __float22bfloat162_rn(make_float2(fp32_values[k*4 + 2], fp32_values[k*4 + 3]));
-
-                        if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
-                            bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
-                            bf16_up   = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
-                            bf16_up   = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
-                        }
 
                         auto gate = __bfloat1622float2(bf16_gate);
                         auto neg_gate_exp = make_float2(
@@ -659,22 +743,27 @@ sm100_fp8_mega_ffn_impl(
                     //   这里我们负责当前 N-tile 的 [BLOCK_N/2] 输出对应的 SF（每行 BLOCK_N/2 / 32 = 2 个 uint8）
                     //   但由于 MegaMoE 的 TMEM 布局不是直接按 SF 行展开，我们只在 warp 0/2 × lane<4 写（与 MegaMoE 一致）
                     if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
-                        // workspace_sf 布局：[gridDim.x, kMaxM, kIntermediate / 32]
-                        // n_tile 对应 L1 输出列 [n_tile * L1_OUT_BLOCK_N : +L1_OUT_BLOCK_N]
-                        // 每个 L1_OUT_BLOCK_N=64 对应 2 个 K-group
+                        // workspace_sf 采用 K-major uint32 布局：
+                        //   [num_ctas, I/128, kMaxM] uint32，每 uint32 打包 4 个沿 K 方向的 UE8M0
+                        // k_sf_idx ∈ [0, I/32) 表示沿 K 方向的 32-element chunk 索引
+                        //   k128 = k_sf_idx / 4,  sub = k_sf_idx % 4
+                        //   byte offset = cta*(I/32*kMaxM) + k128*(kMaxM*4) + token_row*4 + sub
                         const uint32_t token_row = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2;
-                        const uint32_t k_sf_idx = n_tile * 2 + warp_idx_in_wg / 2;   // 每 n_tile 覆盖 2 个 SF 列
-                        // linear index 写 workspace_sf
+                        const uint32_t k_sf_idx  = n_tile * 2 + warp_idx_in_wg / 2;
+                        const uint32_t k128      = k_sf_idx / 4;
+                        const uint32_t sub       = k_sf_idx % 4;
                         auto ws_sf_base = reinterpret_cast<uint8_t*>(workspace_sf);
-                        const uint64_t row_stride_bytes = kIntermediate / 32;
-                        const uint64_t cta_stride_bytes = kMaxM * row_stride_bytes;
-                        const uint64_t base = static_cast<uint64_t>(cta_idx) * cta_stride_bytes;
+                        const uint64_t cta_stride_bytes  = static_cast<uint64_t>(kMaxM) * (kIntermediate / 32);
+                        const uint64_t k128_stride_bytes = static_cast<uint64_t>(kMaxM) * 4;
+                        const uint64_t base = static_cast<uint64_t>(cta_idx) * cta_stride_bytes
+                                            + static_cast<uint64_t>(k128) * k128_stride_bytes
+                                            + static_cast<uint64_t>(sub);
                         const auto sf_x = (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23) & 0xff;
                         const auto sf_y = (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23) & 0xff;
                         if (token_row + 0 < valid_m)
-                            ws_sf_base[base + static_cast<uint64_t>(token_row + 0) * row_stride_bytes + k_sf_idx] = sf_x;
+                            ws_sf_base[base + static_cast<uint64_t>(token_row + 0) * 4] = sf_x;
                         if (token_row + 1 < valid_m)
-                            ws_sf_base[base + static_cast<uint64_t>(token_row + 1) * row_stride_bytes + k_sf_idx] = sf_y;
+                            ws_sf_base[base + static_cast<uint64_t>(token_row + 1) * 4] = sf_y;
                     }
                     __syncwarp();
                 }
