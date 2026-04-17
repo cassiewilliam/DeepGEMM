@@ -337,13 +337,20 @@ sm100_fp8_mega_ffn_impl(
     };
 
     // 片内 Named Barrier 分配
-    constexpr uint32_t kEpilogueFullBarrierIdx = 0;
+    //   bar 0 —— epilogue 全 warp 同步 (count=kNumEpilogueThreads)
+    //   bar 1 —— epilogue per-warpgroup 同步起点
+    //   bar 15 —— Linear1→Linear2 CTA-wide 同步 (count=kNumThreads)
+    //       专用 id 避免与 __syncthreads / epilogue 的 bar 0 冲突
+    //       (同一 id 不同 thread-count 是 PTX 未定义行为，会触发 illegal instruction)
+    constexpr uint32_t kEpilogueFullBarrierIdx   = 0;
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 1;
+    constexpr uint32_t kGridSyncBarrierIdx       = 15;
 
     // Linear1 → Linear2 之间跨 CTA grid-sync lambda。
-    // 所有 warp 的 L1 末尾都要调用一次（参与 __syncthreads），只有 thread 0 做 atomic spin。
+    // 所有 warp 的 L1 末尾都要调用一次：先做 CTA-wide barrier (bar 15)，thread 0 负责
+    // atomic spin 等待其他 CTA 完成，然后再 CTA-wide barrier 放行。
     auto grid_sync_l1_to_l2 = [&] () {
-        __syncthreads();
+        ptx::sync_aligned(kNumThreads, kGridSyncBarrierIdx);
 #if MFFN_DISABLE_GRID_SYNC == 0
         if (thread_idx == 0) {
             __threadfence();
@@ -353,7 +360,7 @@ sm100_fp8_mega_ffn_impl(
                 cnt = atomicAdd(l1_done_counter, 0u);   // volatile load
             }
         }
-        __syncthreads();
+        ptx::sync_aligned(kNumThreads, kGridSyncBarrierIdx);
 #endif
     };
 
