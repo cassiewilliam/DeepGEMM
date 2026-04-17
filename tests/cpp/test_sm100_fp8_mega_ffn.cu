@@ -497,6 +497,18 @@ int main(int argc, char** argv) {
                                    + SMEM_AMAX_ + SMEM_BAR_;
 
     // 在大于 48KB 时必须开启 opt-in
+    std::printf("[kernel] smem_size=%u bytes (%.2f KB), SMEM_CD=%u, SMEM_A/B=%u, stages=%u\n",
+                smem_size, smem_size / 1024.0,
+                SMEM_CD_, SMEM_A_, kNumStages);
+    {
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        int max_dyn_smem = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&max_dyn_smem,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        std::printf("[kernel] max dynamic SMEM per block opt-in = %d bytes (%.2f KB)\n",
+                    max_dyn_smem, max_dyn_smem / 1024.0);
+    }
     if (smem_size > 48 * 1024) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
