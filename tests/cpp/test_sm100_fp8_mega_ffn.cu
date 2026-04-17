@@ -95,9 +95,10 @@ constexpr uint32_t BLOCK_K       = 128;
 #ifndef MFFN_CLUSTER_DIM
 #define MFFN_CLUSTER_DIM 1
 #endif
-// Step 3：Linear2 K 拆分份数。=1 回到 Step 2；=2 将 gridDim 翻倍用 fp32 atomicAdd 合并。
+// Step 3：Linear2 K 拆分份数。=1 回到 Step 2；>=2 gridDim = 8*kL2KSplit，用 fp32 atomicAdd 合并。
+// sweep 实测 M=1..32 上 kL2KSplit=6 (gridDim=48) 最优，~22% 更快于 Step 2。
 #ifndef MFFN_L2_K_SPLIT
-#define MFFN_L2_K_SPLIT 2
+#define MFFN_L2_K_SPLIT 6
 #endif
 
 constexpr uint32_t kNumStages    = MFFN_STAGES;
