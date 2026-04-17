@@ -95,10 +95,11 @@ constexpr uint32_t BLOCK_K       = 128;
 #ifndef MFFN_CLUSTER_DIM
 #define MFFN_CLUSTER_DIM 1
 #endif
-// Step 3：Linear2 K 拆分份数。=1 回到 Step 2；>=2 gridDim = 8*kL2KSplit，用 fp32 atomicAdd 合并。
-// sweep 实测 M=1..32 上 kL2KSplit=6 (gridDim=48) 最优，~22% 更快于 Step 2。
+// Step 3/4：Linear2 K 拆分份数。=1 回到 Step 2；>=2 gridDim = 8*kL2KSplit，用 fp32 atomicAdd 合并。
+// Step 4 放松 L1 N-tile 整除约束 + 升级 grid_sync (bit31 flip + ld.acq 轮询) 后，
+// kL2KSplit=8 (gridDim=64) 在 M=1..32 上最优，~14% 快于 Step 3，已追平 cuBLAS FP16 unfused。
 #ifndef MFFN_L2_K_SPLIT
-#define MFFN_L2_K_SPLIT 6
+#define MFFN_L2_K_SPLIT 8
 #endif
 
 constexpr uint32_t kNumStages    = MFFN_STAGES;
