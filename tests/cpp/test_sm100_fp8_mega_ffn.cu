@@ -465,8 +465,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_w1_sf, w1_sf_km.data(), bytes_w1s,cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_w2_sf, w2_sf_km.data(), bytes_w2s,cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_y, 0, bytes_y));
-    CUDA_CHECK(cudaMemset(d_ws, 0, bytes_ws));
-    CUDA_CHECK(cudaMemset(d_ws_sf, 0, bytes_ws_sf));
+    // 用非零 sentinel 初始化 workspace，便于判定 kernel 究竟有没有写入
+    CUDA_CHECK(cudaMemset(d_ws, 0xCC, bytes_ws));
+    CUDA_CHECK(cudaMemset(d_ws_sf, 0xAA, bytes_ws_sf));
 
     // --- Build CUtensorMap descriptors ---
     // X: [M, H] FP8, swizzle 128B (BLOCK_K bytes)
