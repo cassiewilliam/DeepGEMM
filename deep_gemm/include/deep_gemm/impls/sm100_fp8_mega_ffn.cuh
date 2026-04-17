@@ -699,6 +699,14 @@ sm100_fp8_mega_ffn_impl(
 
                     auto* fp32_values = reinterpret_cast<float*>(values);
 
+                    if (cta_idx == 0 && epilogue_wg_idx == 0 && warp_idx_in_wg == 0
+                        && lane_idx == 0 && s == 0 && i == 0 && n_tile < 3) {
+                        printf("[L1 ACC] cta=%u n_tile=%u acc_stage=%u tmem_addr=0x%x v0..7=[%f %f %f %f %f %f %f %f]\n",
+                               cta_idx, n_tile, accum_stage_idx, tmem_addr,
+                               fp32_values[0], fp32_values[1], fp32_values[2], fp32_values[3],
+                               fp32_values[4], fp32_values[5], fp32_values[6], fp32_values[7]);
+                    }
+
                     // SwiGLU 配对与 MegaMoE 相同：偶索引 gate, 奇索引 up
                     #pragma unroll
                     for (uint32_t k = 0; k < 2; ++ k) {
