@@ -355,18 +355,26 @@ sm100_fp8_mega_ffn_impl(
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 1;
     constexpr uint32_t kGridSyncBarrierIdx       = 15;
 
-    // Linear1 → Linear2 之间跨 CTA grid-sync lambda。
-    // 所有 warp 的 L1 末尾都要调用一次：先做 CTA-wide barrier (bar 15)，thread 0 负责
-    // atomic spin 等待其他 CTA 完成，然后再 CTA-wide barrier 放行。
+    // Linear1 → Linear2 之间跨 CTA grid-sync lambda (Step 4 重写, 灵感源自
+    // deep_gemm::comm::grid_sync 的"bit31 翻转 + ld.acquire 轮询"模式)：
+    //   * 所有非 CTA0 的 thread0 atomic_add_rel(+1)，CTA0 的 thread0 atomic_add_rel(kFinishTag - (N-1))；
+    //     凑齐后 bit31 正好翻转一次，作为本轮"到齐"标志
+    //   * spin 用 `ld.acquire.gpu`（普通 load + acquire 语义）而不是 atomicAdd(counter, 0)，
+    //     把重度的全局 atomic 轮询换成轻量 load，大幅缓解 hot atomic 的 HBM/L2 排队
+    //   * bit31 翻转天然抗 ABA，无需 host 每次 launch 前 memset counter
+    constexpr uint32_t kGridSyncFinishTag = 0x80000000u;
     auto grid_sync_l1_to_l2 = [&] () {
         ptx::sync_aligned(kNumThreads, kGridSyncBarrierIdx);
         if (thread_idx == 0) {
-            __threadfence();
-            const uint32_t target = gridDim.x;
-            uint32_t cnt = atomicAdd(l1_done_counter, 1u) + 1u;
-            while (cnt < target) {
-                cnt = atomicAdd(l1_done_counter, 0u);   // volatile load
-            }
+            const uint32_t num_ctas_u = gridDim.x;
+            const uint32_t delta = (cta_idx == 0)
+                ? (kGridSyncFinishTag - (num_ctas_u - 1u))
+                : 1u;
+            const uint32_t old_val = ptx::atomic_add_rel(l1_done_counter, delta);
+            uint32_t new_val;
+            do {
+                new_val = ptx::ld_acq(l1_done_counter);
+            } while (((new_val ^ old_val) & kGridSyncFinishTag) == 0);
         }
         ptx::sync_aligned(kNumThreads, kGridSyncBarrierIdx);
     };
