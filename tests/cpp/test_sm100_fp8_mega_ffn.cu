@@ -87,7 +87,7 @@ constexpr uint32_t BLOCK_N       = 128;
 constexpr uint32_t BLOCK_K       = 128;
 
 #ifndef MFFN_STAGES
-#define MFFN_STAGES 3
+#define MFFN_STAGES 4
 #endif
 #ifndef MFFN_EPI_THREADS
 #define MFFN_EPI_THREADS 128
