@@ -72,6 +72,12 @@ if [[ "${TRACE:-0}" == "1" ]]; then
     FLAGS+=(-DMEGA_FFN_TRACE=1)
 fi
 
+# 允许环境变量注入 kernel 模板参数 (方便 perf 扫描)
+#   STAGES=4 EPI_THREADS=256 CLUSTER_DIM=2 ./build_mega_ffn.sh
+if [[ -n "${STAGES:-}" ]];      then FLAGS+=(-DMFFN_STAGES=${STAGES}); fi
+if [[ -n "${EPI_THREADS:-}" ]]; then FLAGS+=(-DMFFN_EPI_THREADS=${EPI_THREADS}); fi
+if [[ -n "${CLUSTER_DIM:-}" ]]; then FLAGS+=(-DMFFN_CLUSTER_DIM=${CLUSTER_DIM}); fi
+
 LIBS=(
     "-L${CUDA_HOME}/lib64"
     -lcuda

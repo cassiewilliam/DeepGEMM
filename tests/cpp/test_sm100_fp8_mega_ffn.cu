@@ -85,11 +85,22 @@ constexpr uint32_t kMaxM         = 128;
 constexpr uint32_t BLOCK_M       = 128;
 constexpr uint32_t BLOCK_N       = 128;
 constexpr uint32_t BLOCK_K       = 128;
-constexpr uint32_t kNumStages    = 3;
+
+#ifndef MFFN_STAGES
+#define MFFN_STAGES 3
+#endif
+#ifndef MFFN_EPI_THREADS
+#define MFFN_EPI_THREADS 128
+#endif
+#ifndef MFFN_CLUSTER_DIM
+#define MFFN_CLUSTER_DIM 1
+#endif
+
+constexpr uint32_t kNumStages    = MFFN_STAGES;
 
 constexpr uint32_t kNumNonEpiThreads = 128;
-constexpr uint32_t kNumEpiThreads    = 128;  // 4 warps = 128 threads
-constexpr uint32_t kClusterDim       = 1;
+constexpr uint32_t kNumEpiThreads    = MFFN_EPI_THREADS;  // 4 warps = 128 threads
+constexpr uint32_t kClusterDim       = MFFN_CLUSTER_DIM;
 constexpr uint32_t kNumCTAs          = kHidden / BLOCK_N;   // 8
 constexpr uint32_t kL2NPerCta        = 1;                    // (每 CTA 处理 1 个 Linear2 输出 N-tile)
 
