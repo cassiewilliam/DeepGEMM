@@ -627,25 +627,25 @@ sm100_fp8_mega_ffn_impl(
         uint32_t current_iter_idx = 0;
 
         // -------- Linear1 epilogue: SwiGLU + UE8M0 quant + TMA store to workspace --------
-        const uint32_t num_l1_n_blocks_paired = kL1OutputBlocksN / 2;   // 每 2 个 N-block = 1 对 (gate, up)
-        DG_STATIC_ASSERT(kL1OutputBlocksN % 2 == 0, "kL1OutputBlocksN must be even (gate/up pairing)");
-
-        // NOTES: Linear1 kernel 产出是 [2I / BLOCK_N] 个 N-block，每 2 个相邻 N-block 构成一对:
-        //   偶数 N-block 是 gate[:, n_tile:n_tile+BLOCK_N]
-        //   奇数 N-block 是 up  [:, n_tile:n_tile+BLOCK_N]
-        // 但硬件 TMEM 交错布局 + 现有 MegaMoE 写法把 gate/up 塞到「同一个 N-block 的相邻列」。
-        // 这里我们采用更直观的做法: 每个 N-block 单独量化成 L1_OUT_BLOCK_N 宽度的 intermediate。
-        // 具体 SwiGLU 配对按照「gate_block = 2k, up_block = 2k+1」在写 workspace 时匹配。
-        // 为简化，v1 实现按 MegaMoE 相同语义：每个 Linear1 N-block 自身含 gate/up 相邻列。
         //
-        // WARNING: 这里的配对语义依赖于 host 端 W1 权重布局：在 N=2I 方向上应当是
-        // [gate_0, up_0, gate_1, up_1, ...]（每 BLOCK_N 内部 N/2 是 gate, N/2 是 up）。
-        // host 应当按照此布局准备 W1；否则需要改下面 SwiGLU 的 lane 配对。
+        // 新设计（per-lane = 1 M row）：
+        //   - 每个 epilogue warp 负责 TMEM accumulator 的一个 32-row subpartition：
+        //       warp 0 -> M rows 0..31, warp 1 -> 32..63, warp 2 -> 64..95, warp 3 -> 96..127
+        //   - 对于 kMaxM<=128 的 decoding，实际 valid_m<=32，只有 warp 0 的部分 lane 产出有效数据，
+        //     其余 warp/lane 仍正常读 TMEM 以维持 TMEM barrier 的一致性。
+        //   - W1 在每个 BLOCK_N tile 内: gate=N[0..63], up=N[64..127]; 输出 L1_OUT_BLOCK_N=64 列。
+        //   - TMEM_LOAD 32dp32b8x 每次读 32 rows × 8 cols = 每 lane 1 row × 8 列 floats。
+        //     沿 N 方向步进 8，共 kNumAtomsGate=8 次读完 64 列 gate，再读 64 列 up。
+        //   - 每 lane 收齐 64 个 SwiGLU 输出 → 2 个 32-element SF chunk → 2 个 UE8M0 字节 + 64B FP8。
+        //   - FP8 用 st.shared.u32 写入线性 SMEM (m_row 行号, 每行 64B)；SF 字节直接写回 HBM workspace_sf。
+        //   - 单 warp 0 elect_one 发起 SM90_TMA_STORE_3D 将 128*64B SMEM tile 写到 workspace。
 
-        // Linear1 处理 kL1OutputBlocksN 次 epilogue；Linear2 处理 kL2NPerCta 次
-        constexpr uint32_t kTotalIters = kL1OutputBlocksN;  // will be overwritten by loop count below
+        constexpr uint32_t ATOM_N         = 8;                      // 每次 32dp32b8x 读 8 N-cols
+        constexpr uint32_t kNumAtomsGate  = L1_OUT_BLOCK_N / ATOM_N;// 64/8 = 8
+        constexpr uint32_t kNumSfPerTile  = L1_OUT_BLOCK_N / kGranK;// 64/32 = 2
 
-        // --- Linear1 epilogue loop ---
+        const uint32_t m_row = epilogue_warp_idx * 32 + lane_idx;   // 0..127
+
         uint32_t tma_stage_idx_l1 = 0;
         MFFN_TRACE("EPI L1 loop start n_blocks=%u", kL1OutputBlocksN);
         for (uint32_t n_tile = 0; n_tile < kL1OutputBlocksN; ++ n_tile) {
@@ -653,166 +653,136 @@ sm100_fp8_mega_ffn_impl(
             const auto accum_phase     = (current_iter_idx / kNumEpilogueStages) & 1;
             ++ current_iter_idx;
 
-            MFFN_TRACE("EPI L1 pre tmem_full_wait iter=%u acc_stage=%u acc_phase=%u ntile=%u", current_iter_idx-1, accum_stage_idx, accum_phase, n_tile);
+            MFFN_TRACE("EPI L1 pre tmem_full_wait iter=%u acc_stage=%u acc_phase=%u ntile=%u",
+                       current_iter_idx-1, accum_stage_idx, accum_phase, n_tile);
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
             MFFN_TRACE("EPI L1 post tmem_full_wait iter=%u ntile=%u", current_iter_idx-1, n_tile);
             ptx::tcgen05_after_thread_sync();
 
             const uint32_t valid_m = num_tokens;
 
-            // 为一整个 BLOCK_M × BLOCK_N 的 TMEM accumulator 做:
-            //   1) SwiGLU: pair (gate, up) → silu(gate)*up
-            //   2) amax per-row → UE8M0 sf
-            //   3) cast FP8 E4M3 → STSM → TMA store
-            //
-            // 注意 MegaMoE 的 lane 配对假设 gate/up 在 TMEM 中相邻列（granularity 8）。
-            // 见 MegaMoE epilogue 中对 values[0..7] 的解释。
-
-            float stored_cached_weight = 0;  // dense FFN: no topk weight, 恒为 1
+            // ---- Phase 1: TMEM load gate + up, 计算 SwiGLU ----
+            float swiglu[L1_OUT_BLOCK_N];  // 每 lane 持有 64 个 SwiGLU 输出
+            const uint32_t tmem_base = accum_stage_idx * UMMA_N;
             #pragma unroll
-            for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
-                if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
-                    ptx::tcgen05_before_thread_sync();
-                    tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                    break;
-                }
-
-                float2 swiglu_values[kNumAtomsPerStore * 2];
-                float2 amax_values[kNumAtomsPerStore];
-
+            for (uint32_t i = 0; i < kNumAtomsGate; ++ i) {
+                uint32_t g[ATOM_N], u[ATOM_N];
+                // gate: N = i*8 .. i*8+7
+                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_base + i * ATOM_N,
+                    g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+                // up: N = 64 + i*8 .. 64 + i*8 + 7
+                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_base + L1_OUT_BLOCK_N + i * ATOM_N,
+                    u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]);
                 #pragma unroll
-                for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
-                    const uint32_t j = s * kNumAtomsPerStore + i;
-
-                    // 非 A/B swap 布局下：TMEM_M = token M, TMEM_N = output N。
-                    // 每次 32dp32b8x 读 32 行(=32 个 M token) × 8 列(=8 个 N 输出元素)。
-                    // 对 M=1 decoding，只有 lane 0 的 values 有效。
-                    //   tmem_addr 的步进在 N 方向：i * 8（8 = 一次读 8 cols）
-                    //   accum_stage_idx * UMMA_N 为 accumulator slot 偏移
-                    uint32_t tmem_addr = accum_stage_idx * UMMA_N + i * 8;
-                    uint32_t values[ATOM_M];
-                    cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
-                        values[0], values[1], values[2], values[3],
-                        values[4], values[5], values[6], values[7]);
-                    cutlass::arch::fence_view_async_tmem_load();
-
-                    if (j == WG_BLOCK_M / ATOM_M - 1) {
-                        ptx::tcgen05_before_thread_sync();
-                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                    }
-
-                    auto* fp32_values = reinterpret_cast<float*>(values);
-
-                    if (cta_idx == 0 && epilogue_wg_idx == 0 && warp_idx_in_wg == 0
-                        && s == 0 && i == 0 && n_tile == 0 && lane_idx < 8) {
-                        printf("[L1 ACC] lane=%u n_tile=%u acc_stage=%u tmem_addr=0x%x v0..7=[%f %f %f %f %f %f %f %f]\n",
-                               lane_idx, n_tile, accum_stage_idx, tmem_addr,
-                               fp32_values[0], fp32_values[1], fp32_values[2], fp32_values[3],
-                               fp32_values[4], fp32_values[5], fp32_values[6], fp32_values[7]);
-                    }
-
-                    // SwiGLU 配对与 MegaMoE 相同：偶索引 gate, 奇索引 up
-                    #pragma unroll
-                    for (uint32_t k = 0; k < 2; ++ k) {
-                        auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k*4 + 0], fp32_values[k*4 + 1]));
-                        auto bf16_up   = __float22bfloat162_rn(make_float2(fp32_values[k*4 + 2], fp32_values[k*4 + 3]));
-
-                        auto gate = __bfloat1622float2(bf16_gate);
-                        auto neg_gate_exp = make_float2(
-                            kFastMath ? __expf(-gate.x) : expf(-gate.x),
-                            kFastMath ? __expf(-gate.y) : expf(-gate.y));
-                        const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
-                        if constexpr (kFastMath) {
-                            gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
-                        } else {
-                            gate = {gate.x / denom.x, gate.y / denom.y};
-                        }
-                        const auto up = __bfloat1622float2(bf16_up);
-                        swiglu_values[i * 2 + k] = __fmul2_rn(gate, up);
-                    }
-
-                    amax_values[i].x = math::warp_reduce<4, true>(
-                        cute::max(cute::abs(swiglu_values[i*2 + 0].x), cute::abs(swiglu_values[i*2 + 1].x)),
-                        math::ReduceMax<float>());
-                    amax_values[i].y = math::warp_reduce<4, true>(
-                        cute::max(cute::abs(swiglu_values[i*2 + 0].y), cute::abs(swiglu_values[i*2 + 1].y)),
-                        math::ReduceMax<float>());
-                    if (lane_idx < 4)
-                        smem_amax_reduction[epilogue_warp_idx * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx] = amax_values[i];
-                    __syncwarp();
+                for (uint32_t k = 0; k < ATOM_N; ++ k) {
+                    const float gate_f = __uint_as_float(g[k]);
+                    const float up_f   = __uint_as_float(u[k]);
+                    const float ne     = kFastMath ? __expf(-gate_f) : expf(-gate_f);
+                    const float denom  = 1.0f + ne;
+                    const float silu_g = kFastMath ? gate_f * math::fast_rcp(denom) : gate_f / denom;
+                    swiglu[i * ATOM_N + k] = silu_g * up_f;
                 }
-
-                const uint32_t tma_stage_idx = s % kNumTMAStoreStages;
-                ptx::tma_store_wait<kNumTMAStoreStages - 1>();
-                ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
-
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
-                    const float2 wp_amax =
-                        smem_amax_reduction[(epilogue_warp_idx ^ 1) * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx % 4];
-                    amax_values[i].x = cute::max(amax_values[i].x, wp_amax.x);
-                    amax_values[i].y = cute::max(amax_values[i].y, wp_amax.y);
-
-                    float2 sf, sf_inv;
-                    math::get_e4m3_sf_and_sf_inv(amax_values[i], sf, sf_inv);
-
-                    const float2 upper = __fmul2_rn(swiglu_values[i*2 + 0], sf_inv);
-                    const float2 lower = __fmul2_rn(swiglu_values[i*2 + 1], sf_inv);
-                    const auto fp8x4 = __nv_fp8x4_e4m3(make_float4(upper.x, upper.y, lower.x, lower.y));
-
-                    uint32_t row = lane_idx;
-                    uint32_t col = warp_idx_in_wg;
-                    auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd_l1[tma_stage_idx])
-                                    + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
-                                    + i * ATOM_M * L1_OUT_BLOCK_N
-                                    + row * L1_OUT_BLOCK_N
-                                    + (col ^ (row / 2)) * kNumBankGroupBytes;
-                    ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4, smem_ptr);
-
-                    // 写 UE8M0 SF 到 workspace_sf
-                    //   SF 的 K 方向粒度 32，每个 token 每 32 个元素一个 SF
-                    //   这里我们负责当前 N-tile 的 [BLOCK_N/2] 输出对应的 SF（每行 BLOCK_N/2 / 32 = 2 个 uint8）
-                    //   但由于 MegaMoE 的 TMEM 布局不是直接按 SF 行展开，我们只在 warp 0/2 × lane<4 写（与 MegaMoE 一致）
-                    if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
-                        // workspace_sf 采用 K-major uint32 布局：
-                        //   [num_ctas, I/128, kMaxM] uint32，每 uint32 打包 4 个沿 K 方向的 UE8M0
-                        // k_sf_idx ∈ [0, I/32) 表示沿 K 方向的 32-element chunk 索引
-                        //   k128 = k_sf_idx / 4,  sub = k_sf_idx % 4
-                        //   byte offset = cta*(I/32*kMaxM) + k128*(kMaxM*4) + token_row*4 + sub
-                        const uint32_t token_row = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2;
-                        const uint32_t k_sf_idx  = n_tile * 2 + warp_idx_in_wg / 2;
-                        const uint32_t k128      = k_sf_idx / 4;
-                        const uint32_t sub       = k_sf_idx % 4;
-                        auto ws_sf_base = reinterpret_cast<uint8_t*>(workspace_sf);
-                        const uint64_t cta_stride_bytes  = static_cast<uint64_t>(kMaxM) * (kIntermediate / 32);
-                        const uint64_t k128_stride_bytes = static_cast<uint64_t>(kMaxM) * 4;
-                        const uint64_t base = static_cast<uint64_t>(cta_idx) * cta_stride_bytes
-                                            + static_cast<uint64_t>(k128) * k128_stride_bytes
-                                            + static_cast<uint64_t>(sub);
-                        const auto sf_x = (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23) & 0xff;
-                        const auto sf_y = (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23) & 0xff;
-                        if (token_row + 0 < valid_m)
-                            ws_sf_base[base + static_cast<uint64_t>(token_row + 0) * 4] = sf_x;
-                        if (token_row + 1 < valid_m)
-                            ws_sf_base[base + static_cast<uint64_t>(token_row + 1) * 4] = sf_y;
-                    }
-                    __syncwarp();
-                }
-                ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
-
-                // warp 0 发起 TMA store 到 workspace
-                if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                    uint32_t out_n_idx = n_tile * L1_OUT_BLOCK_N;
-                    uint32_t out_m_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M;
-                    cute::tma_store_fence();
-                    cute::SM90_TMA_STORE_3D::copy(
-                        &tensor_map_interm,
-                        reinterpret_cast<uint8_t*>(smem_cd_l1[tma_stage_idx]) + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N,
-                        out_n_idx, out_m_idx, cta_idx);
-                    cute::tma_store_arrive();
-                }
-                __syncwarp();
             }
+            cutlass::arch::fence_view_async_tmem_load();
+
+            if (cta_idx == 0 && epilogue_warp_idx == 0 && lane_idx == 0 && n_tile == 0) {
+                printf("[L1 SWIGLU] cta=0 m=0 n_tile=0 out0..7=[%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f]\n",
+                       swiglu[0], swiglu[1], swiglu[2], swiglu[3],
+                       swiglu[4], swiglu[5], swiglu[6], swiglu[7]);
+            }
+
+            // 所有 epilogue 线程都 arrive 一次（barrier 初始化 count = kNumEpilogueThreads）
+            ptx::tcgen05_before_thread_sync();
+            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+
+            // ---- Phase 2: 等 SMEM CD 双缓冲空闲 ----
+            const uint32_t tma_stage_idx = tma_stage_idx_l1;
+            ptx::tma_store_wait<kNumTMAStoreStages - 1>();
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+            // ---- Phase 3: per-row amax, UE8M0 sf, FP8 量化 ----
+            uint8_t fp8_row[L1_OUT_BLOCK_N];
+            uint8_t sf_bytes_row[kNumSfPerTile];
+            #pragma unroll
+            for (uint32_t sf_idx = 0; sf_idx < kNumSfPerTile; ++ sf_idx) {
+                float amax = 0.f;
+                #pragma unroll
+                for (uint32_t j = 0; j < kGranK; ++ j)
+                    amax = fmaxf(amax, fabsf(swiglu[sf_idx * kGranK + j]));
+
+                uint8_t sf_byte = 0;
+                float   sf_inv  = 0.f;
+                if (amax > 0.f) {
+                    const float factor = amax * (1.0f / 448.0f);
+                    uint32_t bits = __float_as_uint(factor);
+                    uint32_t exp  = (bits >> 23) & 0xffu;
+                    uint32_t man  = bits & 0x007fffffu;
+                    if (man != 0) ++ exp;
+                    if (exp > 0xffu) exp = 0xffu;
+                    sf_byte = static_cast<uint8_t>(exp);
+                    const float sf_f = __uint_as_float(exp << 23);
+                    sf_inv = 1.0f / sf_f;
+                }
+                sf_bytes_row[sf_idx] = sf_byte;
+                #pragma unroll
+                for (uint32_t j = 0; j < kGranK; j += 4) {
+                    const float4 v = make_float4(
+                        swiglu[sf_idx * kGranK + j + 0] * sf_inv,
+                        swiglu[sf_idx * kGranK + j + 1] * sf_inv,
+                        swiglu[sf_idx * kGranK + j + 2] * sf_inv,
+                        swiglu[sf_idx * kGranK + j + 3] * sf_inv);
+                    __nv_fp8x4_e4m3 q(v);
+                    uint32_t packed;
+                    __builtin_memcpy(&packed, &q, 4);
+                    __builtin_memcpy(&fp8_row[sf_idx * kGranK + j], &packed, 4);
+                }
+            }
+
+            // ---- Phase 4: 写 SMEM (线性布局, m_row * 64 偏移) + 写 SF 字节到 workspace_sf ----
+            auto smem_cd_base = reinterpret_cast<uint8_t*>(smem_cd_l1[tma_stage_idx]);
+            if (m_row < valid_m) {
+                auto dst = smem_cd_base + m_row * L1_OUT_BLOCK_N;
+                #pragma unroll
+                for (uint32_t j = 0; j < L1_OUT_BLOCK_N; j += 4) {
+                    uint32_t packed;
+                    __builtin_memcpy(&packed, &fp8_row[j], 4);
+                    ptx::st_shared(reinterpret_cast<uint32_t*>(dst + j), packed);
+                }
+
+                // workspace_sf 布局: [num_ctas, I/128, kMaxM] uint32 (K-major)
+                //   每 uint32 打包 4 个沿 K 方向连续的 UE8M0 字节。
+                //   byte offset = cta*cta_stride + k128*(kMaxM*4) + m_row*4 + sub
+                auto ws_sf_base = reinterpret_cast<uint8_t*>(workspace_sf);
+                const uint64_t cta_stride_bytes  = static_cast<uint64_t>(kMaxM) * (kIntermediate / 32);
+                const uint64_t k128_stride_bytes = static_cast<uint64_t>(kMaxM) * 4;
+                #pragma unroll
+                for (uint32_t sf_idx = 0; sf_idx < kNumSfPerTile; ++ sf_idx) {
+                    const uint32_t k_sf_idx = n_tile * kNumSfPerTile + sf_idx;
+                    const uint32_t k128     = k_sf_idx / 4;
+                    const uint32_t sub      = k_sf_idx & 3;
+                    const uint64_t off      = static_cast<uint64_t>(cta_idx) * cta_stride_bytes
+                                            + static_cast<uint64_t>(k128) * k128_stride_bytes
+                                            + static_cast<uint64_t>(m_row) * 4
+                                            + static_cast<uint64_t>(sub);
+                    ws_sf_base[off] = sf_bytes_row[sf_idx];
+                }
+            }
+
+            // SMEM 写 → TMA store 需要 fence + 全 epilogue 同步
+            cute::tma_store_fence();
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+            // warp 0 elect_one 发起 TMA store: box = (L1_OUT_BLOCK_N, BLOCK_M, 1) 到 workspace[cta_idx]
+            if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                const uint32_t out_n_idx = n_tile * L1_OUT_BLOCK_N;
+                const uint32_t out_m_idx = 0;
+                cute::SM90_TMA_STORE_3D::copy(
+                    &tensor_map_interm,
+                    smem_cd_base,
+                    out_n_idx, out_m_idx, cta_idx);
+                cute::tma_store_arrive();
+            }
+            __syncwarp();
             tma_stage_idx_l1 = (tma_stage_idx_l1 + 1) % kNumTMAStoreStages;
         }
 
