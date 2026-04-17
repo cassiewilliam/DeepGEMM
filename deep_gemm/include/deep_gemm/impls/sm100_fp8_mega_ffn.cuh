@@ -685,12 +685,6 @@ sm100_fp8_mega_ffn_impl(
             }
             cutlass::arch::fence_view_async_tmem_load();
 
-            if (cta_idx == 0 && epilogue_warp_idx == 0 && lane_idx == 0 && n_tile == 0) {
-                printf("[L1 SWIGLU] cta=0 m=0 n_tile=0 out0..7=[%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f]\n",
-                       swiglu[0], swiglu[1], swiglu[2], swiglu[3],
-                       swiglu[4], swiglu[5], swiglu[6], swiglu[7]);
-            }
-
             // 所有 epilogue 线程都 arrive 一次（barrier 初始化 count = kNumEpilogueThreads）
             ptx::tcgen05_before_thread_sync();
             tmem_empty_barriers[accum_stage_idx]->arrive(0u);

@@ -364,7 +364,6 @@ static void cpu_reference_ffn(
         }
 
     // SwiGLU: 对每个 BLOCK_N，前半 gate，后半 up
-    //   对应 intermediate[m, block*(BLOCK_N/2) + j] = silu(gate) * up
     std::vector<float> interm(static_cast<size_t>(M) * kIntermediate, 0.f);
     auto silu = [](float v) { return v / (1.f + std::exp(-v)); };
     const uint32_t n_blocks = (2 * kIntermediate) / BLOCK_N;
@@ -376,13 +375,19 @@ static void cpu_reference_ffn(
                 interm[m * kIntermediate + b * (BLOCK_N / 2) + j] = silu(g) * u;
             }
 
-    // Linear2: y[m, h] = sum_i interm[m, i] * W2[h, i]
+    // 关键：要与 GPU 对齐，需把 interm 量化成 FP8 + UE8M0（每 32 个元素一个 sf），
+    // 然后再 dequant 做 Linear2，模拟 MMA 的 SF-dequant 语义。
+    std::vector<uint8_t> interm_fp8, interm_sf;
+    quantize_fp8_ue8m0(interm.data(), M, kIntermediate, interm_fp8, interm_sf);
+    auto interm_dq = deq_act(interm_fp8, interm_sf, M, kIntermediate);
+
+    // Linear2: y[m, h] = sum_i interm_dq[m, i] * W2[h, i]
     y_bf16.assign(static_cast<size_t>(M) * kHidden, nv_bfloat16(0.f));
     for (uint32_t m = 0; m < M; ++ m)
         for (uint32_t h = 0; h < kHidden; ++ h) {
             float acc = 0.f;
             for (uint32_t i = 0; i < kIntermediate; ++ i)
-                acc += interm[m * kIntermediate + i] * W2[h * kIntermediate + i];
+                acc += interm_dq[m * kIntermediate + i] * W2[h * kIntermediate + i];
             y_bf16[m * kHidden + h] = __float2bfloat16(acc);
         }
 }
@@ -511,12 +516,13 @@ int main(int argc, char** argv) {
     // workspace intermediate FP8 [num_ctas, kMaxM, kIntermediate]
     //   写入视图 (SM90_TMA_STORE_3D)：inner=I, outer=M, batch=cta_idx
     //   tile  = (L1_OUT_BLOCK_N, BLOCK_M, 1) -- 但 TMA store 固定 box = (L1_OUT_BLOCK_N, STORE_BLOCK_M)
+    // 写视图：box = (L1_OUT_BLOCK_N=64, BLOCK_M=128, 1)，不做 swizzle（与 epilogue SMEM 线性布局一致）
     auto tma_interm = make_tma_3d("interm_w", d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
                                   kIntermediate, kMaxM, kNumCTAs,
                                   BLOCK_N / 2, BLOCK_M, 1,
                                   static_cast<uint64_t>(kIntermediate),
                                   static_cast<uint64_t>(kMaxM) * kIntermediate,
-                                  CU_TENSOR_MAP_SWIZZLE_64B);
+                                  CU_TENSOR_MAP_SWIZZLE_NONE);
     // 读视图：给 Linear2 TMA-A 用，box = (BLOCK_K, BLOCK_M)
     auto tma_interm_load = make_tma_3d("interm_r", d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
                                        kIntermediate, kMaxM, kNumCTAs,
