@@ -187,14 +187,16 @@ sm100_fp8_mega_ffn_impl(
     //   - kL2KSplit == 1：Step 2 行为，每 CTA 跑满 kL2KBlocks 个 L2 K 块。
     //   - kL2KSplit >= 2：每 L2 N-tile 分给 kL2KSplit 个 CTA，每 CTA 只跑 kL2KBlocks/kL2KSplit
     //                     个 K 块产生 partial，再 atomicAdd fp32 到 y_fp32 合并。
-    // Linear1 始终跨所有 CTA (gridDim.x) 均摊 N-split。
+    //
+    // Step 4：放松 L1 N-tile 数必须整除 gridDim 的约束 —— 允许 gridDim > kL1OutputBlocksN。
+    //   每个 CTA 最多负责 kL1NPerCtaCeil = ceil(kL1OutputBlocksN / kNumCTAs) 个 L1 N-tile；
+    //   `l1_n_start` / `l1_n_count` 在运行期截断到 [0, kL1OutputBlocksN)。多余的 CTA 在 L1
+    //   阶段 l1_n_count==0，直接跳过 L1，但仍参与 grid-sync 与 L2 计算。
     DG_STATIC_ASSERT(kL2KBlocks % kL2KSplit == 0,
                      "L2 K block count must be divisible by kL2KSplit");
-    DG_STATIC_ASSERT(kL1OutputBlocksN % (kL2OutputBlocksN * kL2KSplit) == 0,
-                     "L1 N-tile count must be divisible by gridDim (= kL2OutputBlocksN * kL2KSplit)");
-    constexpr uint32_t kNumCTAs           = kL2OutputBlocksN * kL2KSplit;         // e.g. 8 or 16
-    constexpr uint32_t kL1NPerCta         = kL1OutputBlocksN / kNumCTAs;          // 6 or 3
-    constexpr uint32_t kL2KBlocksPerCta   = kL2KBlocks / kL2KSplit;               // 24 or 12
+    constexpr uint32_t kNumCTAs           = kL2OutputBlocksN * kL2KSplit;         // e.g. 8, 48, 96
+    constexpr uint32_t kL1NPerCtaCeil     = (kL1OutputBlocksN + kNumCTAs - 1) / kNumCTAs;  // 6/1/1...
+    constexpr uint32_t kL2KBlocksPerCta   = kL2KBlocks / kL2KSplit;               // 24/4/2/1
 
     // -----------------------------------------------------------------------------
     // 坐标系 / 线程角色
@@ -216,8 +218,14 @@ sm100_fp8_mega_ffn_impl(
     const uint32_t l2_k_half_for_cta = cta_idx / kL2OutputBlocksN;
     const uint32_t l2_k_base_block   = l2_k_half_for_cta * kL2KBlocksPerCta;
 
-    // Linear1 本 CTA 负责的起始 N-tile (N-split 均摊到所有 CTA)
-    const uint32_t kL1NStart = cta_idx * kL1NPerCta;
+    // Step 4：Linear1 N-split 允许 uneven —— 前若干个 CTA 做 1~kL1NPerCtaCeil 个 L1 tile，
+    //         剩余 CTA (cta_idx * kL1NPerCtaCeil >= kL1OutputBlocksN) l1_n_count==0 直接跳过 L1。
+    const uint32_t l1_n_start_raw = cta_idx * kL1NPerCtaCeil;
+    const uint32_t l1_n_start     = l1_n_start_raw < kL1OutputBlocksN ? l1_n_start_raw : kL1OutputBlocksN;
+    const uint32_t l1_n_end       = (l1_n_start + kL1NPerCtaCeil) < kL1OutputBlocksN
+                                        ? (l1_n_start + kL1NPerCtaCeil)
+                                        : kL1OutputBlocksN;
+    const uint32_t l1_n_count     = l1_n_end - l1_n_start;  // 可能为 0
 
     // Prefetch 所有 TMA descriptor
     if (warp_idx == 0) {
@@ -432,10 +440,10 @@ sm100_fp8_mega_ffn_impl(
             }
         };
 
-        // Linear1 只做分配给本 CTA 的 kL1NPerCta 个 N-tile；X 不依赖 N，循环次数减小即可。
+        // Linear1 只做分配给本 CTA 的 l1_n_count 个 N-tile；l1_n_count==0 时不发 TMA。
         tma_a_loop(std::integral_constant<Phase, Phase::Linear1>{},
                    &tensor_map_x, &tensor_map_x_sf,
-                   kL1NPerCta, 0);
+                   l1_n_count, 0);
         grid_sync_l1_to_l2();
         tma_a_loop(std::integral_constant<Phase, Phase::Linear2>{},
                    &tensor_map_interm_load, &tensor_map_interm_sf_load,
@@ -493,10 +501,10 @@ sm100_fp8_mega_ffn_impl(
             }
         };
 
-        // Linear1 N-split: CTA k 读 W1 的 [kL1NStart, kL1NStart+kL1NPerCta) 个 N-tile。
+        // Linear1 N-split: CTA k 读 W1 的 [l1_n_start, l1_n_end) 个 N-tile (可能为空)。
         tma_b_loop(std::integral_constant<Phase, Phase::Linear1>{},
                    &tensor_map_w1, &tensor_map_w1_sf,
-                   kL1NPerCta, kL1NStart);
+                   l1_n_count, l1_n_start);
         grid_sync_l1_to_l2();
         // Step 3：Linear2 的 N-tile 由 cta_idx % kL2OutputBlocksN 决定（与 K-split 无关）
         tma_b_loop(std::integral_constant<Phase, Phase::Linear2>{},
@@ -641,7 +649,7 @@ sm100_fp8_mega_ffn_impl(
             MFFN_TRACE("MMA exit ntile loop phase=%d", (int)phase_tag);
         };
 
-        run_mma(Phase::Linear1, kL1NPerCta);
+        run_mma(Phase::Linear1, l1_n_count);
         grid_sync_l1_to_l2();
         run_mma(Phase::Linear2, kL2NPerCta);
 
@@ -704,9 +712,9 @@ sm100_fp8_mega_ffn_impl(
         const uint32_t m_row = epilogue_warp_idx * 32 + lane_idx;   // 0..127
 
         uint32_t tma_stage_idx_l1 = 0;
-        MFFN_TRACE("EPI L1 loop start n_blocks=%u (split of %u)", kL1NPerCta, kL1OutputBlocksN);
-        for (uint32_t n_tile = 0; n_tile < kL1NPerCta; ++ n_tile) {
-            const uint32_t global_n_tile = kL1NStart + n_tile;  // 全局 N 序号
+        MFFN_TRACE("EPI L1 loop start n_blocks=%u (split of %u)", l1_n_count, kL1OutputBlocksN);
+        for (uint32_t n_tile = 0; n_tile < l1_n_count; ++ n_tile) {
+            const uint32_t global_n_tile = l1_n_start + n_tile;  // 全局 N 序号
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase     = (current_iter_idx / kNumEpilogueStages) & 1;
             ++ current_iter_idx;
