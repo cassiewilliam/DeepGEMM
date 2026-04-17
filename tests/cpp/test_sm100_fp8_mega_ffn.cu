@@ -242,6 +242,88 @@ static void quantize_fp8_ue8m0(const float* src, uint32_t rows, uint32_t cols,
 }
 
 // -----------------------------------------------------------------------------
+// CPU 参考：只算 Linear1 + SwiGLU + 再量化到 FP8 E4M3 + UE8M0 SF。
+// 输出格式严格匹配 kernel 的 workspace layout：
+//   ws_fp8[cta=0..num_ctas-1][m][i]           = FP8 (interm[m][i] / sf[m][i/32])
+//   ws_sf [cta=0..num_ctas-1][k128][m][sub]   = UE8M0 byte for (m, k_sf=k128*4+sub)
+// 所有 CTA 的 workspace 应当相同（当前 kernel 让每个 CTA 冗余计算 Linear1）。
+// -----------------------------------------------------------------------------
+static void cpu_reference_l1_workspace(
+    const std::vector<uint8_t>& x_fp8, const std::vector<uint8_t>& x_sf,
+    const std::vector<uint8_t>& w1_fp8, const std::vector<uint8_t>& w1_sf,
+    uint32_t M, uint32_t num_ctas,
+    std::vector<uint8_t>& ws_fp8, std::vector<uint8_t>& ws_sf_bytes,
+    std::vector<float>& interm_out /* for downstream use */)
+{
+    auto deq_act = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& s,
+                       uint32_t rows, uint32_t cols) {
+        std::vector<float> out(static_cast<size_t>(rows) * cols);
+        for (uint32_t r = 0; r < rows; ++ r)
+            for (uint32_t kg = 0; kg < cols / kGranK; ++ kg) {
+                float scale = ue8m0_to_float(s[r * (cols / kGranK) + kg]);
+                for (uint32_t t = 0; t < kGranK; ++ t)
+                    out[r * cols + kg * kGranK + t] =
+                        fp8_e4m3_to_float(a[r * cols + kg * kGranK + t]) * scale;
+            }
+        return out;
+    };
+    auto X  = deq_act(x_fp8, x_sf, M, kHidden);
+    auto W1 = deq_act(w1_fp8, w1_sf, 2 * kIntermediate, kHidden);
+
+    // Linear1
+    std::vector<float> interm_raw(static_cast<size_t>(M) * (2 * kIntermediate), 0.f);
+    for (uint32_t m = 0; m < M; ++ m)
+        for (uint32_t n = 0; n < 2 * kIntermediate; ++ n) {
+            float acc = 0.f;
+            for (uint32_t k = 0; k < kHidden; ++ k)
+                acc += X[m * kHidden + k] * W1[n * kHidden + k];
+            interm_raw[m * (2 * kIntermediate) + n] = acc;
+        }
+
+    // SwiGLU
+    interm_out.assign(static_cast<size_t>(M) * kIntermediate, 0.f);
+    auto silu = [](float v) { return v / (1.f + std::exp(-v)); };
+    const uint32_t n_blocks = (2 * kIntermediate) / BLOCK_N;
+    for (uint32_t m = 0; m < M; ++ m)
+        for (uint32_t b = 0; b < n_blocks; ++ b)
+            for (uint32_t j = 0; j < BLOCK_N / 2; ++ j) {
+                float g = interm_raw[m * (2 * kIntermediate) + b * BLOCK_N + j];
+                float u = interm_raw[m * (2 * kIntermediate) + b * BLOCK_N + BLOCK_N / 2 + j];
+                interm_out[m * kIntermediate + b * (BLOCK_N / 2) + j] = silu(g) * u;
+            }
+
+    // 再量化到 FP8 + UE8M0 SF（每 32 个元素一个 sf，per-row）
+    std::vector<uint8_t> one_fp8, one_sf;
+    quantize_fp8_ue8m0(interm_out.data(), M, kIntermediate, one_fp8, one_sf);
+
+    // 广播到 num_ctas 个 CTA
+    const size_t per_cta_fp8 = static_cast<size_t>(kMaxM) * kIntermediate;
+    const size_t per_cta_sf  = static_cast<size_t>(kMaxM) * (kIntermediate / kGranK);
+    ws_fp8.assign(per_cta_fp8 * num_ctas, 0);
+    ws_sf_bytes.assign(per_cta_sf * num_ctas, 0);
+
+    for (uint32_t c = 0; c < num_ctas; ++ c) {
+        // FP8: 直接 layout 和 one_fp8 一致：[M][I]，写到 [M=0..M-1][i]，其余行保持 0
+        for (uint32_t m = 0; m < M; ++ m) {
+            std::memcpy(&ws_fp8[c * per_cta_fp8 + m * kIntermediate],
+                        &one_fp8[m * kIntermediate], kIntermediate);
+        }
+        // SF: kernel 布局 [num_ctas][I/128][M][4] 字节 —— k128_stride = M*4, k_sf = k128*4+sub
+        for (uint32_t m = 0; m < M; ++ m) {
+            for (uint32_t k_sf = 0; k_sf < kIntermediate / kGranK; ++ k_sf) {
+                const uint32_t k128 = k_sf / 4;
+                const uint32_t sub  = k_sf % 4;
+                const size_t off = c * per_cta_sf
+                                 + static_cast<size_t>(k128) * kMaxM * 4
+                                 + static_cast<size_t>(m) * 4
+                                 + sub;
+                ws_sf_bytes[off] = one_sf[m * (kIntermediate / kGranK) + k_sf];
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // CPU 参考：FFN SwiGLU
 //   y = down(silu(W1_gate x) * (W1_up x))
 // 假定 W1 在 N=2I 方向布局为 [gate_half || up_half] 交错：
@@ -536,6 +618,61 @@ int main(int argc, char** argv) {
         tma_interm, tma_interm_load, tma_interm_sf, tma_interm_sf_load,
         tma_y));
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // --- Validate Linear1 workspace (FP8 + UE8M0 SF) per CTA ---
+    {
+        std::vector<uint8_t> ws_fp8_ref, ws_sf_ref;
+        std::vector<float>   interm_fp32;
+        cpu_reference_l1_workspace(x_fp8, x_sf, w1_fp8, w1_sf, M, kNumCTAs,
+                                   ws_fp8_ref, ws_sf_ref, interm_fp32);
+
+        std::vector<uint8_t> ws_fp8_host(bytes_ws, 0);
+        std::vector<uint8_t> ws_sf_host (bytes_ws_sf, 0);
+        CUDA_CHECK(cudaMemcpy(ws_fp8_host.data(), d_ws,    bytes_ws,    cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ws_sf_host.data(),  d_ws_sf, bytes_ws_sf, cudaMemcpyDeviceToHost));
+
+        // 对每个 CTA 逐 token 对比
+        const size_t per_cta_fp8 = static_cast<size_t>(kMaxM) * kIntermediate;
+        const size_t per_cta_sf  = static_cast<size_t>(kMaxM) * (kIntermediate / kGranK);
+        for (uint32_t c = 0; c < kNumCTAs; ++ c) {
+            double sum_abs = 0.0, max_abs = 0.0;
+            size_t nz = 0, total = 0;
+            size_t first_bad_cnt = 0;
+            for (uint32_t m = 0; m < M; ++ m) {
+                for (uint32_t i = 0; i < kIntermediate; ++ i) {
+                    uint8_t got = ws_fp8_host[c * per_cta_fp8 + m * kIntermediate + i];
+                    uint8_t exp = ws_fp8_ref [c * per_cta_fp8 + m * kIntermediate + i];
+
+                    const uint32_t k_sf = i / kGranK;
+                    const uint32_t k128 = k_sf / 4;
+                    const uint32_t sub  = k_sf % 4;
+                    const size_t sf_off_got = c * per_cta_sf
+                                            + static_cast<size_t>(k128) * kMaxM * 4
+                                            + static_cast<size_t>(m) * 4 + sub;
+                    uint8_t sf_got = ws_sf_host[sf_off_got];
+                    uint8_t sf_exp = ws_sf_ref [sf_off_got];
+
+                    float got_f = fp8_e4m3_to_float(got) * ue8m0_to_float(sf_got);
+                    float exp_f = fp8_e4m3_to_float(exp) * ue8m0_to_float(sf_exp);
+                    float ref_f = interm_fp32[m * kIntermediate + i];  // 原始 fp32 中间值
+                    float d = std::fabs(got_f - exp_f);
+                    sum_abs += d;
+                    max_abs = std::max<double>(max_abs, d);
+                    if (std::fabs(ref_f) > 1e-4f) ++ nz;
+                    ++ total;
+                    if (c == 0 && first_bad_cnt < 10
+                        && (got != exp || sf_got != sf_exp)) {
+                        std::printf("  [L1-WS diff] cta=%u m=%u i=%u got_fp8=0x%02x exp_fp8=0x%02x "
+                                    "sf_got=0x%02x sf_exp=0x%02x got_f=%.4f exp_f=%.4f ref_fp32=%.4f\n",
+                                    c, m, i, got, exp, sf_got, sf_exp, got_f, exp_f, ref_f);
+                        ++ first_bad_cnt;
+                    }
+                }
+            }
+            std::printf("[L1-WS] cta=%u mean|Δ_l1|=%.4f max|Δ_l1|=%.4f nonzero_ref=%zu/%zu\n",
+                        c, sum_abs / (double)total, max_abs, nz, total);
+        }
+    }
 
     // --- Validate against CPU reference ---
     std::vector<nv_bfloat16> y_ref;
