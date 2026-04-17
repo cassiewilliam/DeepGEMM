@@ -1,7 +1,7 @@
 // =====================================================================================
 // tests/cpp/test_ffn_cublas_baseline.cu
 //
-// Qwen3-0.6B FFN cuBLAS baseline：W1(gate) + W3(up) + SiLU + W2 三段不融合，
+// Qwen3-0.6B FFN cuBLAS baseline：W1(gate+up 合并) + SwiGLU + W2 三段不融合，
 // 作为 MegaFFN (FP8 fused) 的性能对照。
 //
 // 变体：
@@ -11,10 +11,9 @@
 //   hidden (H)       = 1024
 //   intermediate (I) = 3072
 //
-// 计算：
-//   gate[M,I] = X[M,H] @ W1[I,H]^T
-//   up  [M,I] = X[M,H] @ W3[I,H]^T
-//   interm    = SiLU(gate) * up   // elementwise
+// 计算（gate/up 合并为 W1[2I, H] 单次 GEMM，与 MegaFFN kernel 语义一致，避免两次 HBM 往返）：
+//   gu[M, 2I] = X[M,H] @ W1[2I,H]^T           // 前 I 列 = gate, 后 I 列 = up
+//   interm    = SiLU(gu[:, :I]) * gu[:, I:]   // SwiGLU
 //   Y [M,H]   = interm[M,I] @ W2[H,I]^T
 //
 // 用法：
@@ -44,16 +43,20 @@
 constexpr uint32_t H = 1024;
 constexpr uint32_t I = 3072;
 
-// SiLU(x) * y elementwise，in-place on gate buffer
-__global__ void silu_mul_kernel(__nv_bfloat16* __restrict__ gate,
-                                const __nv_bfloat16* __restrict__ up,
-                                uint32_t n_elems) {
+// SwiGLU on fused gate/up buffer gu[M, 2I]，输出 interm[M, I]。
+// 约定 gu[m, 0..I)   = gate, gu[m, I..2I) = up。
+__global__ void swiglu_kernel(const __nv_bfloat16* __restrict__ gu,
+                              __nv_bfloat16* __restrict__ interm,
+                              uint32_t M, uint32_t I) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n_elems = M * I;
     if (idx >= n_elems) return;
-    float g = __bfloat162float(gate[idx]);
-    float u = __bfloat162float(up[idx]);
+    uint32_t m = idx / I;
+    uint32_t c = idx - m * I;
+    float g = __bfloat162float(gu[m * 2 * I + c]);
+    float u = __bfloat162float(gu[m * 2 * I + I + c]);
     float s = g / (1.0f + expf(-g));           // SiLU
-    gate[idx] = __float2bfloat16(s * u);
+    interm[idx] = __float2bfloat16(s * u);
 }
 
 int main(int argc, char** argv) {
@@ -66,28 +69,25 @@ int main(int argc, char** argv) {
     std::mt19937 rng(0xABCDu);
     std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
 
+    // W1 合并 gate+up 为 [2I, H] 的单个权重矩阵 (与 MegaFFN kernel 一致)
     std::vector<__nv_bfloat16> hX(static_cast<size_t>(M) * H);
-    std::vector<__nv_bfloat16> hW1(static_cast<size_t>(I) * H);
-    std::vector<__nv_bfloat16> hW3(static_cast<size_t>(I) * H);
+    std::vector<__nv_bfloat16> hW1(static_cast<size_t>(2) * I * H);
     std::vector<__nv_bfloat16> hW2(static_cast<size_t>(H) * I);
     for (auto& v : hX)  v = __float2bfloat16(dist(rng));
     for (auto& v : hW1) v = __float2bfloat16(dist(rng));
-    for (auto& v : hW3) v = __float2bfloat16(dist(rng));
     for (auto& v : hW2) v = __float2bfloat16(dist(rng));
 
-    __nv_bfloat16 *dX, *dW1, *dW3, *dW2, *dGate, *dUp, *dY;
-    CUDA_CHECK(cudaMalloc(&dX,   sizeof(__nv_bfloat16) * M * H));
-    CUDA_CHECK(cudaMalloc(&dW1,  sizeof(__nv_bfloat16) * I * H));
-    CUDA_CHECK(cudaMalloc(&dW3,  sizeof(__nv_bfloat16) * I * H));
-    CUDA_CHECK(cudaMalloc(&dW2,  sizeof(__nv_bfloat16) * H * I));
-    CUDA_CHECK(cudaMalloc(&dGate,sizeof(__nv_bfloat16) * M * I));
-    CUDA_CHECK(cudaMalloc(&dUp,  sizeof(__nv_bfloat16) * M * I));
-    CUDA_CHECK(cudaMalloc(&dY,   sizeof(__nv_bfloat16) * M * H));
+    __nv_bfloat16 *dX, *dW1, *dW2, *dGU, *dInterm, *dY;
+    CUDA_CHECK(cudaMalloc(&dX,     sizeof(__nv_bfloat16) * M * H));
+    CUDA_CHECK(cudaMalloc(&dW1,    sizeof(__nv_bfloat16) * 2 * I * H));
+    CUDA_CHECK(cudaMalloc(&dW2,    sizeof(__nv_bfloat16) * H * I));
+    CUDA_CHECK(cudaMalloc(&dGU,    sizeof(__nv_bfloat16) * M * 2 * I));
+    CUDA_CHECK(cudaMalloc(&dInterm,sizeof(__nv_bfloat16) * M * I));
+    CUDA_CHECK(cudaMalloc(&dY,     sizeof(__nv_bfloat16) * M * H));
 
-    CUDA_CHECK(cudaMemcpy(dX,  hX.data(),  sizeof(__nv_bfloat16) * M * H, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dW1, hW1.data(), sizeof(__nv_bfloat16) * I * H, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dW3, hW3.data(), sizeof(__nv_bfloat16) * I * H, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dW2, hW2.data(), sizeof(__nv_bfloat16) * H * I, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dX,  hX.data(),  sizeof(__nv_bfloat16) * M * H,         cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dW1, hW1.data(), sizeof(__nv_bfloat16) * 2 * I * H,     cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dW2, hW2.data(), sizeof(__nv_bfloat16) * H * I,         cudaMemcpyHostToDevice));
 
     cublasHandle_t cb;
     CUBLAS_CHECK(cublasCreate(&cb));
@@ -96,27 +96,8 @@ int main(int argc, char** argv) {
 
     const float alpha_f = 1.0f, beta_f = 0.0f;
 
-    // cuBLAS 是 column-major。我们按 row-major 解读成：
-    //   C[m,n] = A[m,k] * B[k,n]  =>  在 cuBLAS 视角下 C^T = B^T * A^T
-    //   即调用 gemm(op=N, op=N, n, m, k, B, n, A, k, C, n).
-    // 我们用常规写法：把 A 当成 [K,M] col-major, B 当成 [N,K] col-major, C 当成 [N,M] col-major.
-    // 等价于 row-major 的 A[M,K], B[K,N] -> C[M,N].
-    //
-    // 为了 clarity，我们直接用 cublasGemmEx 做：
-    //   gate = X @ W1^T  (X:[M,H], W1:[I,H])
-    //     row-major: gate[M,I] = X[M,H] * W1[I,H]^T = X * (W1^T)^T
-    //     column-major 等价: gate_cm[I,M] = W1_cm[H,I]^T^T * X_cm[H,M]^T^T ... (略)
-    //   简单做法：col-major 视角
-    //     A = W1 (col-major [H,I])，opA = N
-    //     B = X  (col-major [H,M])，opB = T
-    //     C = gate (col-major [I,M])
-    //   由 cuBLAS 语义：C = op(A) * op(B) = W1^T * X  -> 维度 [I,H]*[H,M] = [I,M] ✓
-    //   gate[i,m] = sum_h W1[h,i] * X[h,m]
-    //             = sum_h W1_row[i,h] * X_row[m,h]   (row-major 下 W1[i,h]、X[m,h])
-    //             = (X @ W1^T)[m,i]                   ✓
-    //
-    // 综上：
-    //   op(A)=T,  op(B)=N,  A=W1 (ld=H), B=X (ld=H), C=gate (ld=I), m=I, n=M, k=H.
+    // cuBLAS 是 column-major；row-major 下的 C[M,N] = A[M,K] @ B[K,N]^T 等价于
+    // col-major 下 opA=T, opB=N, A=B_cm[K,N], B=A_cm[K,M], C=C_cm[N,M], m=N, n=M, k=K。
 
     auto gemm_bf16 = [&](cublasOperation_t opA, cublasOperation_t opB,
                          int m, int n, int k,
@@ -133,19 +114,17 @@ int main(int argc, char** argv) {
     };
 
     auto launch_ffn = [&]() {
-        // gate = X @ W1^T  : opA=T, opB=N, A=W1[H,I]col, B=X[H,M]col, C=gate[I,M]col
-        gemm_bf16(CUBLAS_OP_T, CUBLAS_OP_N, I, M, H,
-                  dW1, H, dX, H, dGate, I);
-        // up   = X @ W3^T
-        gemm_bf16(CUBLAS_OP_T, CUBLAS_OP_N, I, M, H,
-                  dW3, H, dX, H, dUp, I);
-        // interm = SiLU(gate) * up  (in-place on gate)
+        // Linear1 (gate+up 合并): gu[M, 2I] = X[M, H] @ W1[2I, H]^T
+        //   col-major: opA=T, opB=N, A=W1[H, 2I] (lda=H), B=X[H, M] (ldb=H), C=gu[2I, M] (ldc=2I)
+        gemm_bf16(CUBLAS_OP_T, CUBLAS_OP_N, 2 * I, M, H,
+                  dW1, H, dX, H, dGU, 2 * I);
+        // SwiGLU: interm[M, I] = SiLU(gu[:, :I]) * gu[:, I:]
         int n_elems = static_cast<int>(M) * I;
         int blk = 256;
-        silu_mul_kernel<<<(n_elems + blk - 1) / blk, blk>>>(dGate, dUp, n_elems);
-        // Y = interm @ W2^T  : opA=T, opB=N, A=W2[I,H]col, B=gate[I,M]col, C=Y[H,M]col
+        swiglu_kernel<<<(n_elems + blk - 1) / blk, blk>>>(dGU, dInterm, M, I);
+        // Linear2: Y[M, H] = interm[M, I] @ W2[H, I]^T
         gemm_bf16(CUBLAS_OP_T, CUBLAS_OP_N, H, M, I,
-                  dW2, I, dGate, I, dY, H);
+                  dW2, I, dInterm, I, dY, H);
     };
 
     // Warmup
@@ -168,8 +147,8 @@ int main(int argc, char** argv) {
     std::printf("[cublasBF16] M=%u  avg latency = %.3f us  (%.2f GFLOP/s @ BF16)\n",
                 M, avg_us, flops * 1e-9);
 
-    cudaFree(dX); cudaFree(dW1); cudaFree(dW3); cudaFree(dW2);
-    cudaFree(dGate); cudaFree(dUp); cudaFree(dY);
+    cudaFree(dX); cudaFree(dW1); cudaFree(dW2);
+    cudaFree(dGU); cudaFree(dInterm); cudaFree(dY);
     cublasDestroy(cb);
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     return 0;
