@@ -443,8 +443,10 @@ int main(int argc, char** argv) {
     uint8_t* d_w2      = nullptr;
     uint8_t* d_w2_sf   = nullptr;
     nv_bfloat16* d_y   = nullptr;
-    uint8_t* d_ws      = nullptr;    // per-cta intermediate FP8 [num_ctas, kMaxM, kIntermediate]
-    uint8_t* d_ws_sf   = nullptr;    // per-cta intermediate SF  [num_ctas, kMaxM, kIntermediate/32]
+    // Step 2 起：workspace 跨 CTA 共享，单例 2D 布局（去掉 num_ctas 维度）。
+    uint8_t*  d_ws               = nullptr;   // [kMaxM, kIntermediate] FP8
+    uint8_t*  d_ws_sf            = nullptr;   // [kIntermediate/128, kMaxM, 4] uint8 (K-major uint32 viewed as byte)
+    uint32_t* d_l1_done_counter  = nullptr;   // Linear1→Linear2 cross-CTA barrier
 
     const size_t bytes_x  = static_cast<size_t>(kMaxM) * kHidden;
     const size_t bytes_xs = static_cast<size_t>(kMaxM) * (kHidden / kGranK);
@@ -453,8 +455,8 @@ int main(int argc, char** argv) {
     const size_t bytes_w2 = static_cast<size_t>(kHidden) * kIntermediate;
     const size_t bytes_w2s= static_cast<size_t>(kHidden) * (kIntermediate / kGranK);
     const size_t bytes_y  = static_cast<size_t>(kMaxM) * kHidden * sizeof(nv_bfloat16);
-    const size_t bytes_ws = static_cast<size_t>(kNumCTAs) * kMaxM * kIntermediate;
-    const size_t bytes_ws_sf = static_cast<size_t>(kNumCTAs) * kMaxM * (kIntermediate / kGranK);
+    const size_t bytes_ws    = static_cast<size_t>(kMaxM) * kIntermediate;
+    const size_t bytes_ws_sf = static_cast<size_t>(kMaxM) * (kIntermediate / kGranK);
 
     CUDA_CHECK(cudaMalloc(&d_x,     bytes_x));
     CUDA_CHECK(cudaMalloc(&d_x_sf,  bytes_xs));
@@ -463,8 +465,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_w2,    bytes_w2));
     CUDA_CHECK(cudaMalloc(&d_w2_sf, bytes_w2s));
     CUDA_CHECK(cudaMalloc(&d_y,     bytes_y));
-    CUDA_CHECK(cudaMalloc(&d_ws,    bytes_ws));
-    CUDA_CHECK(cudaMalloc(&d_ws_sf, bytes_ws_sf));
+    CUDA_CHECK(cudaMalloc(&d_ws,               bytes_ws));
+    CUDA_CHECK(cudaMalloc(&d_ws_sf,            bytes_ws_sf));
+    CUDA_CHECK(cudaMalloc(&d_l1_done_counter,  sizeof(uint32_t)));
 
     CUDA_CHECK(cudaMemcpy(d_x,     x_fp8.data(),  bytes_x,  cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_w1,    w1_fp8.data(), bytes_w1, cudaMemcpyHostToDevice));
@@ -524,37 +527,31 @@ int main(int argc, char** argv) {
                                  BLOCK_N, 1,
                                  static_cast<uint64_t>(kHidden) * sizeof(uint32_t));
 
-    // workspace intermediate FP8 [num_ctas, kMaxM, kIntermediate]
-    //   写入视图 (SM90_TMA_STORE_3D)：inner=I, outer=M, batch=cta_idx
-    //   tile  = (L1_OUT_BLOCK_N, BLOCK_M, 1) -- 但 TMA store 固定 box = (L1_OUT_BLOCK_N, STORE_BLOCK_M)
-    // 写视图：box = (L1_OUT_BLOCK_N=64, BLOCK_M=128, 1)，不做 swizzle（与 epilogue SMEM 线性布局一致）
-    auto tma_interm = make_tma_3d("interm_w", d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                  kIntermediate, kMaxM, kNumCTAs,
-                                  BLOCK_N / 2, BLOCK_M, 1,
+    // Step 2：workspace intermediate FP8 [kMaxM, kIntermediate]（跨 CTA 共享 2D）
+    //   写视图 (SM90_TMA_STORE_2D)：inner=I, outer=M, box=(L1_OUT_BLOCK_N=64, BLOCK_M=128)
+    //   读视图 (Linear2 TMA-A)：box=(BLOCK_K=128, BLOCK_M=128)，swizzle 128B
+    auto tma_interm = make_tma_2d("interm_w", d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                                  kIntermediate, kMaxM,
+                                  BLOCK_N / 2, BLOCK_M,
                                   static_cast<uint64_t>(kIntermediate),
-                                  static_cast<uint64_t>(kMaxM) * kIntermediate,
                                   CU_TENSOR_MAP_SWIZZLE_NONE);
-    // 读视图：给 Linear2 TMA-A 用，box = (BLOCK_K, BLOCK_M)
-    auto tma_interm_load = make_tma_3d("interm_r", d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                       kIntermediate, kMaxM, kNumCTAs,
-                                       BLOCK_K, BLOCK_M, 1,
+    auto tma_interm_load = make_tma_2d("interm_r", d_ws, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                                       kIntermediate, kMaxM,
+                                       BLOCK_K, BLOCK_M,
                                        static_cast<uint64_t>(kIntermediate),
-                                       static_cast<uint64_t>(kMaxM) * kIntermediate,
                                        CU_TENSOR_MAP_SWIZZLE_128B);
 
-    // workspace SF: K-major uint32 布局 [num_ctas, I/128, kMaxM]
-    //   写视图（当前 epilogue 走字节写，不经 TMA；保留 descriptor 仅作占位）
-    //   读视图：Linear2 TMA-A 的 SFA 源 —— inner=M, outer=I/128, batch=num_ctas
-    auto tma_interm_sf = make_tma_3d("interm_sf_w", d_ws_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                                     kMaxM, kIntermediate / 128, kNumCTAs,
-                                     128, 1, 1,
-                                     static_cast<uint64_t>(kMaxM) * sizeof(uint32_t),
-                                     static_cast<uint64_t>(kMaxM) * (kIntermediate / 128) * sizeof(uint32_t));
-    auto tma_interm_sf_load = make_tma_3d("interm_sf_r", d_ws_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                                          kMaxM, kIntermediate / 128, kNumCTAs,
-                                          128, 1, 1,
-                                          static_cast<uint64_t>(kMaxM) * sizeof(uint32_t),
-                                          static_cast<uint64_t>(kMaxM) * (kIntermediate / 128) * sizeof(uint32_t));
+    // Step 2：workspace SF K-major uint32 [I/128, kMaxM]（跨 CTA 共享 2D）
+    //   写视图（kernel 走字节写，此 descriptor 仅占位）
+    //   读视图：Linear2 TMA-A SFA 源 —— inner=M, outer=I/128
+    auto tma_interm_sf = make_tma_2d("interm_sf_w", d_ws_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                                     kMaxM, kIntermediate / 128,
+                                     128, 1,
+                                     static_cast<uint64_t>(kMaxM) * sizeof(uint32_t));
+    auto tma_interm_sf_load = make_tma_2d("interm_sf_r", d_ws_sf, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                                          kMaxM, kIntermediate / 128,
+                                          128, 1,
+                                          static_cast<uint64_t>(kMaxM) * sizeof(uint32_t));
 
     // Y: [M, H] BF16 —— swizzle 128B 时 box[0]*2 必须 = 128 字节，故 box[0]=64.
     // 当前 kernel epilogue 对 BLOCK_N=128 只发一次 TMA store，先用 SWIZZLE_NONE 跑通，
@@ -626,22 +623,30 @@ int main(int argc, char** argv) {
     cfg.attrs = attr;
     cfg.numAttrs = 1;
 
+    auto do_launch = [&]() {
+        // Linear1→Linear2 barrier counter 每次 launch 前清零
+        CUDA_CHECK(cudaMemsetAsync(d_l1_done_counter, 0, sizeof(uint32_t), cfg.stream));
+        CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel,
+            static_cast<void*>(d_y),
+            static_cast<void*>(d_ws),
+            static_cast<void*>(d_ws_sf),
+            d_l1_done_counter,
+            M,
+            tma_x, tma_x_sf, tma_w1, tma_w1_sf, tma_w2, tma_w2_sf,
+            tma_interm, tma_interm_load, tma_interm_sf, tma_interm_sf_load,
+            tma_y));
+    };
+
     // Warmup + correctness
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel,
-        static_cast<void*>(d_y),
-        static_cast<void*>(d_ws),
-        static_cast<void*>(d_ws_sf),
-        M,
-        tma_x, tma_x_sf, tma_w1, tma_w1_sf, tma_w2, tma_w2_sf,
-        tma_interm, tma_interm_load, tma_interm_sf, tma_interm_sf_load,
-        tma_y));
+    do_launch();
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // --- Validate Linear1 workspace (FP8 + UE8M0 SF) per CTA ---
+    // --- Validate Linear1 shared workspace (FP8 + UE8M0 SF) ---
+    // Step 2 起 workspace 跨 CTA 共享，单个 [M, I] slice，对齐 CPU reference 的 cta=0 副本。
     {
         std::vector<uint8_t> ws_fp8_ref, ws_sf_ref;
         std::vector<float>   interm_fp32;
-        cpu_reference_l1_workspace(x_fp8, x_sf, w1_fp8, w1_sf, M, kNumCTAs,
+        cpu_reference_l1_workspace(x_fp8, x_sf, w1_fp8, w1_sf, M, /*num_ctas=*/1u,
                                    ws_fp8_ref, ws_sf_ref, interm_fp32);
 
         std::vector<uint8_t> ws_fp8_host(bytes_ws, 0);
@@ -649,47 +654,40 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(ws_fp8_host.data(), d_ws,    bytes_ws,    cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(ws_sf_host.data(),  d_ws_sf, bytes_ws_sf, cudaMemcpyDeviceToHost));
 
-        // 对每个 CTA 逐 token 对比
-        const size_t per_cta_fp8 = static_cast<size_t>(kMaxM) * kIntermediate;
-        const size_t per_cta_sf  = static_cast<size_t>(kMaxM) * (kIntermediate / kGranK);
-        for (uint32_t c = 0; c < kNumCTAs; ++ c) {
-            double sum_abs = 0.0, max_abs = 0.0;
-            size_t nz = 0, total = 0;
-            size_t first_bad_cnt = 0;
-            for (uint32_t m = 0; m < M; ++ m) {
-                for (uint32_t i = 0; i < kIntermediate; ++ i) {
-                    uint8_t got = ws_fp8_host[c * per_cta_fp8 + m * kIntermediate + i];
-                    uint8_t exp = ws_fp8_ref [c * per_cta_fp8 + m * kIntermediate + i];
+        double sum_abs = 0.0, max_abs = 0.0;
+        size_t nz = 0, total = 0;
+        size_t first_bad_cnt = 0;
+        for (uint32_t m = 0; m < M; ++ m) {
+            for (uint32_t i = 0; i < kIntermediate; ++ i) {
+                uint8_t got = ws_fp8_host[m * kIntermediate + i];
+                uint8_t exp = ws_fp8_ref [m * kIntermediate + i];
 
-                    const uint32_t k_sf = i / kGranK;
-                    const uint32_t k128 = k_sf / 4;
-                    const uint32_t sub  = k_sf % 4;
-                    const size_t sf_off_got = c * per_cta_sf
-                                            + static_cast<size_t>(k128) * kMaxM * 4
-                                            + static_cast<size_t>(m) * 4 + sub;
-                    uint8_t sf_got = ws_sf_host[sf_off_got];
-                    uint8_t sf_exp = ws_sf_ref [sf_off_got];
+                const uint32_t k_sf = i / kGranK;
+                const uint32_t k128 = k_sf / 4;
+                const uint32_t sub  = k_sf % 4;
+                const size_t sf_off = static_cast<size_t>(k128) * kMaxM * 4
+                                    + static_cast<size_t>(m) * 4 + sub;
+                uint8_t sf_got = ws_sf_host[sf_off];
+                uint8_t sf_exp = ws_sf_ref [sf_off];
 
-                    float got_f = fp8_e4m3_to_float(got) * ue8m0_to_float(sf_got);
-                    float exp_f = fp8_e4m3_to_float(exp) * ue8m0_to_float(sf_exp);
-                    float ref_f = interm_fp32[m * kIntermediate + i];  // 原始 fp32 中间值
-                    float d = std::fabs(got_f - exp_f);
-                    sum_abs += d;
-                    max_abs = std::max<double>(max_abs, d);
-                    if (std::fabs(ref_f) > 1e-4f) ++ nz;
-                    ++ total;
-                    if (c == 0 && first_bad_cnt < 10
-                        && (got != exp || sf_got != sf_exp)) {
-                        std::printf("  [L1-WS diff] cta=%u m=%u i=%u got_fp8=0x%02x exp_fp8=0x%02x "
-                                    "sf_got=0x%02x sf_exp=0x%02x got_f=%.4f exp_f=%.4f ref_fp32=%.4f\n",
-                                    c, m, i, got, exp, sf_got, sf_exp, got_f, exp_f, ref_f);
-                        ++ first_bad_cnt;
-                    }
+                float got_f = fp8_e4m3_to_float(got) * ue8m0_to_float(sf_got);
+                float exp_f = fp8_e4m3_to_float(exp) * ue8m0_to_float(sf_exp);
+                float ref_f = interm_fp32[m * kIntermediate + i];
+                float d = std::fabs(got_f - exp_f);
+                sum_abs += d;
+                max_abs = std::max<double>(max_abs, d);
+                if (std::fabs(ref_f) > 1e-4f) ++ nz;
+                ++ total;
+                if (first_bad_cnt < 10 && (got != exp || sf_got != sf_exp)) {
+                    std::printf("  [L1-WS diff] m=%u i=%u got_fp8=0x%02x exp_fp8=0x%02x "
+                                "sf_got=0x%02x sf_exp=0x%02x got_f=%.4f exp_f=%.4f ref_fp32=%.4f\n",
+                                m, i, got, exp, sf_got, sf_exp, got_f, exp_f, ref_f);
+                    ++ first_bad_cnt;
                 }
             }
-            std::printf("[L1-WS] cta=%u mean|Δ_l1|=%.4f max|Δ_l1|=%.4f nonzero_ref=%zu/%zu\n",
-                        c, sum_abs / (double)total, max_abs, nz, total);
         }
+        std::printf("[L1-WS] mean|Δ_l1|=%.4f max|Δ_l1|=%.4f nonzero_ref=%zu/%zu\n",
+                    sum_abs / (double)total, max_abs, nz, total);
     }
 
     // --- Validate against CPU reference ---
@@ -719,23 +717,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventCreate(&e0));
     CUDA_CHECK(cudaEventCreate(&e1));
     // warmup
-    for (int i = 0; i < 5; ++ i) {
-        CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel,
-            static_cast<void*>(d_y), static_cast<void*>(d_ws), static_cast<void*>(d_ws_sf),
-            M,
-            tma_x, tma_x_sf, tma_w1, tma_w1_sf, tma_w2, tma_w2_sf,
-            tma_interm, tma_interm_load, tma_interm_sf, tma_interm_sf_load,
-            tma_y));
-    }
+    for (int i = 0; i < 5; ++ i) do_launch();
     CUDA_CHECK(cudaEventRecord(e0));
-    for (uint32_t i = 0; i < num_iters; ++ i) {
-        CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel,
-            static_cast<void*>(d_y), static_cast<void*>(d_ws), static_cast<void*>(d_ws_sf),
-            M,
-            tma_x, tma_x_sf, tma_w1, tma_w1_sf, tma_w2, tma_w2_sf,
-            tma_interm, tma_interm_load, tma_interm_sf, tma_interm_sf_load,
-            tma_y));
-    }
+    for (uint32_t i = 0; i < num_iters; ++ i) do_launch();
     CUDA_CHECK(cudaEventRecord(e1));
     CUDA_CHECK(cudaEventSynchronize(e1));
     float ms = 0.f;
@@ -749,6 +733,7 @@ int main(int argc, char** argv) {
     cudaFree(d_w2); cudaFree(d_w2_sf);
     cudaFree(d_y);
     cudaFree(d_ws); cudaFree(d_ws_sf);
+    cudaFree(d_l1_done_counter);
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     return 0;
 }

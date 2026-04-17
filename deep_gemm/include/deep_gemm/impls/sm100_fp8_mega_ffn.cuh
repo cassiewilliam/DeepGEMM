@@ -99,8 +99,9 @@ template <
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_mega_ffn_impl(
     void* y,
-    void* workspace,               // FP8 intermediate, laid out [gridDim.x][kMaxM][kIntermediate]
-    void* workspace_sf,            // UE8M0 scale factors, [gridDim.x][kMaxM][kIntermediate/32]
+    void* workspace,               // FP8 intermediate, shared [kMaxM][kIntermediate] (共享, N-split 写)
+    void* workspace_sf,            // UE8M0 scale factors, K-major [kIntermediate/128, kMaxM, 4]
+    uint32_t* l1_done_counter,     // global counter, host 端 memset 0; 用作 Linear1→Linear2 cross-CTA barrier
     const uint32_t num_tokens,     // valid M (<= kMaxM)
     const __grid_constant__ cute::TmaDescriptor tensor_map_x,
     const __grid_constant__ cute::TmaDescriptor tensor_map_x_sf,
@@ -179,6 +180,12 @@ sm100_fp8_mega_ffn_impl(
     constexpr uint32_t kL1KBlocks         = kHidden / BLOCK_K;               // e.g. 8
     constexpr uint32_t kL2KBlocks         = kIntermediate / BLOCK_K;         // e.g. 24
     constexpr uint32_t L1_OUT_BLOCK_N     = BLOCK_N / 2;                     // SwiGLU 减半
+
+    // Linear1 跨 CTA N-split：gridDim.x == kL2OutputBlocksN，每 CTA 负责 kL1NPerCta 个 L1 N-tile。
+    // 对 Qwen3-0.6B：48 / 8 = 6。每 CTA 只算 1/8 的 Linear1，消除原 8× 冗余。
+    DG_STATIC_ASSERT(kL1OutputBlocksN % kL2OutputBlocksN == 0,
+                     "L1 N-tile count must be divisible by L2 N-tile count for even split");
+    constexpr uint32_t kL1NPerCta         = kL1OutputBlocksN / kL2OutputBlocksN; // e.g. 6
 
     // -----------------------------------------------------------------------------
     // 坐标系 / 线程角色
@@ -315,6 +322,21 @@ sm100_fp8_mega_ffn_impl(
     constexpr uint32_t kEpilogueFullBarrierIdx = 0;
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 1;
 
+    // Linear1 → Linear2 之间跨 CTA grid-sync lambda。
+    // 所有 warp 的 L1 末尾都要调用一次（参与 __syncthreads），只有 thread 0 做 atomic spin。
+    auto grid_sync_l1_to_l2 = [&] () {
+        __syncthreads();
+        if (thread_idx == 0) {
+            __threadfence();
+            const uint32_t target = gridDim.x;
+            uint32_t cnt = atomicAdd(l1_done_counter, 1u) + 1u;
+            while (cnt < target) {
+                cnt = atomicAdd(l1_done_counter, 0u);   // volatile load
+            }
+        }
+        __syncthreads();
+    };
+
     // 寄存器预算
     constexpr uint32_t kNumNonEpilogueRegisters = 40;
     constexpr uint32_t kNumEpilogueRegisters    = 208;
@@ -360,24 +382,14 @@ sm100_fp8_mega_ffn_impl(
                     if (cute::elect_one_sync()) {
                         MFFN_TRACE("TMA-A pre copy A stage=%u kblk=%u ntile=%u desc_a=%p desc_sf=%p",
                                    stage_idx, k_block_idx, n_tile, tensor_map_a_ptr, tensor_map_a_sf_ptr);
-                        // Linear1: X 是 2D；Linear2: interm_load / interm_sf_load 是 3D（第 3 维=CTA 索引）
-                        if constexpr (phase_tag == Phase::Linear1) {
-                            tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, false>(
-                                tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
-                                k_idx, m_idx, 1);
-                            tma::copy<SF_BLOCK_M, 1, 0, uint32_t, false>(
-                                tensor_map_a_sf_ptr, full_barriers[stage_idx],
-                                smem_sfa[stage_idx],
-                                sfa_m_idx, sfa_k128_idx, 1);
-                        } else {
-                            tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, true>(
-                                tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
-                                k_idx, m_idx, 1, cta_idx);
-                            tma::copy<SF_BLOCK_M, 1, 0, uint32_t, true>(
-                                tensor_map_a_sf_ptr, full_barriers[stage_idx],
-                                smem_sfa[stage_idx],
-                                sfa_m_idx, sfa_k128_idx, 1, cta_idx);
-                        }
+                        // Step 2 起 workspace 改为共享 2D，L1 / L2 两阶段的 TMA-A 都走 2D。
+                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, false>(
+                            tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
+                            k_idx, m_idx, 1);
+                        tma::copy<SF_BLOCK_M, 1, 0, uint32_t, false>(
+                            tensor_map_a_sf_ptr, full_barriers[stage_idx],
+                            smem_sfa[stage_idx],
+                            sfa_m_idx, sfa_k128_idx, 1);
                         MFFN_TRACE("TMA-A post copy A+SF stage=%u kblk=%u", stage_idx, k_block_idx);
 
                         uint32_t arrive_bytes = SMEM_A_SIZE_PER_STAGE + SF_BLOCK_M * sizeof(uint32_t);
@@ -389,9 +401,11 @@ sm100_fp8_mega_ffn_impl(
             }
         };
 
+        // Linear1 只做分配给本 CTA 的 kL1NPerCta 个 N-tile；X 不依赖 N，循环次数减小即可。
         tma_a_loop(std::integral_constant<Phase, Phase::Linear1>{},
                    &tensor_map_x, &tensor_map_x_sf,
-                   kL1OutputBlocksN, 0);
+                   kL1NPerCta, 0);
+        grid_sync_l1_to_l2();
         tma_a_loop(std::integral_constant<Phase, Phase::Linear2>{},
                    &tensor_map_interm_load, &tensor_map_interm_sf_load,
                    kL2NPerCta, 0);
@@ -443,9 +457,11 @@ sm100_fp8_mega_ffn_impl(
             }
         };
 
+        // Linear1 N-split: CTA k 读 W1 的 [cta_idx*6, cta_idx*6+6) 个 N-tile。
         tma_b_loop(std::integral_constant<Phase, Phase::Linear1>{},
                    &tensor_map_w1, &tensor_map_w1_sf,
-                   kL1OutputBlocksN, 0);
+                   kL1NPerCta, cta_idx * kL1NPerCta);
+        grid_sync_l1_to_l2();
         tma_b_loop(std::integral_constant<Phase, Phase::Linear2>{},
                    &tensor_map_w2, &tensor_map_w2_sf,
                    kL2NPerCta, cta_idx * kL2NPerCta);
@@ -586,7 +602,8 @@ sm100_fp8_mega_ffn_impl(
             MFFN_TRACE("MMA exit ntile loop phase=%d", (int)phase_tag);
         };
 
-        run_mma(Phase::Linear1, kL1OutputBlocksN);
+        run_mma(Phase::Linear1, kL1NPerCta);
+        grid_sync_l1_to_l2();
         run_mma(Phase::Linear2, kL2NPerCta);
 
         // Drain last tmem_empty
@@ -600,6 +617,7 @@ sm100_fp8_mega_ffn_impl(
     // -------------------------------------------------------------------------
     } else if (warp_idx == 3) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        grid_sync_l1_to_l2();
 
     // =========================================================================
     // 角色 ⑤：Epilogue warps —— SwiGLU+quant(L1) / BF16 cast(L2)
@@ -647,8 +665,9 @@ sm100_fp8_mega_ffn_impl(
         const uint32_t m_row = epilogue_warp_idx * 32 + lane_idx;   // 0..127
 
         uint32_t tma_stage_idx_l1 = 0;
-        MFFN_TRACE("EPI L1 loop start n_blocks=%u", kL1OutputBlocksN);
-        for (uint32_t n_tile = 0; n_tile < kL1OutputBlocksN; ++ n_tile) {
+        MFFN_TRACE("EPI L1 loop start n_blocks=%u (split of %u)", kL1NPerCta, kL1OutputBlocksN);
+        for (uint32_t n_tile = 0; n_tile < kL1NPerCta; ++ n_tile) {
+            const uint32_t global_n_tile = cta_idx * kL1NPerCta + n_tile;  // 跨 CTA 全局 N 序号 0..47
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase     = (current_iter_idx / kNumEpilogueStages) & 1;
             ++ current_iter_idx;
@@ -743,19 +762,18 @@ sm100_fp8_mega_ffn_impl(
                     ptx::st_shared(reinterpret_cast<uint32_t*>(dst + j), packed);
                 }
 
-                // workspace_sf 布局: [num_ctas, I/128, kMaxM] uint32 (K-major)
+                // workspace_sf 布局: [I/128, kMaxM] uint32 (K-major, 共享, 无 cta_idx 维度)
                 //   每 uint32 打包 4 个沿 K 方向连续的 UE8M0 字节。
-                //   byte offset = cta*cta_stride + k128*(kMaxM*4) + m_row*4 + sub
+                //   byte offset = k128*(kMaxM*4) + m_row*4 + sub
+                //   其中 k_sf_idx = global_n_tile * kNumSfPerTile + sf_idx (全局 SF idx)
                 auto ws_sf_base = reinterpret_cast<uint8_t*>(workspace_sf);
-                const uint64_t cta_stride_bytes  = static_cast<uint64_t>(kMaxM) * (kIntermediate / 32);
                 const uint64_t k128_stride_bytes = static_cast<uint64_t>(kMaxM) * 4;
                 #pragma unroll
                 for (uint32_t sf_idx = 0; sf_idx < kNumSfPerTile; ++ sf_idx) {
-                    const uint32_t k_sf_idx = n_tile * kNumSfPerTile + sf_idx;
+                    const uint32_t k_sf_idx = global_n_tile * kNumSfPerTile + sf_idx;
                     const uint32_t k128     = k_sf_idx / 4;
                     const uint32_t sub      = k_sf_idx & 3;
-                    const uint64_t off      = static_cast<uint64_t>(cta_idx) * cta_stride_bytes
-                                            + static_cast<uint64_t>(k128) * k128_stride_bytes
+                    const uint64_t off      = static_cast<uint64_t>(k128) * k128_stride_bytes
                                             + static_cast<uint64_t>(m_row) * 4
                                             + static_cast<uint64_t>(sub);
                     ws_sf_base[off] = sf_bytes_row[sf_idx];
@@ -766,14 +784,14 @@ sm100_fp8_mega_ffn_impl(
             cute::tma_store_fence();
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
-            // warp 0 elect_one 发起 TMA store: box = (L1_OUT_BLOCK_N, BLOCK_M, 1) 到 workspace[cta_idx]
+            // warp 0 elect_one 发起 2D TMA store: box = (L1_OUT_BLOCK_N, BLOCK_M) 写入共享 workspace
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                const uint32_t out_n_idx = n_tile * L1_OUT_BLOCK_N;
+                const uint32_t out_n_idx = global_n_tile * L1_OUT_BLOCK_N;
                 const uint32_t out_m_idx = 0;
-                cute::SM90_TMA_STORE_3D::copy(
+                cute::SM90_TMA_STORE_2D::copy(
                     &tensor_map_interm,
                     smem_cd_base,
-                    out_n_idx, out_m_idx, cta_idx);
+                    out_n_idx, out_m_idx);
                 cute::tma_store_arrive();
             }
             __syncwarp();
@@ -783,6 +801,9 @@ sm100_fp8_mega_ffn_impl(
         // Linear1 结束：等所有 TMA store 落盘 → 让 Linear2 TMA-A 能从 workspace 正确读取
         ptx::tma_store_wait<0>();
         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+        // 跨 CTA grid-sync：等所有 CTA 的 Linear1 都完成，workspace 才对所有 CTA 一致。
+        grid_sync_l1_to_l2();
 
         // --- Linear2 epilogue loop ---
         //
