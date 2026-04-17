@@ -684,11 +684,15 @@ sm100_fp8_mega_ffn_impl(
                 for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                     const uint32_t j = s * kNumAtomsPerStore + i;
 
-                    uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                    // 非 A/B swap 布局下：TMEM_M = token M, TMEM_N = output N。
+                    // 每次 32dp32b8x 读 32 行(=32 个 M token) × 8 列(=8 个 N 输出元素)。
+                    // 对 M=1 decoding，只有 lane 0 的 values 有效。
+                    //   tmem_addr 的步进在 N 方向：i * 8（8 = 一次读 8 cols）
+                    //   accum_stage_idx * UMMA_N 为 accumulator slot 偏移
+                    uint32_t tmem_addr = accum_stage_idx * UMMA_N + i * 8;
                     uint32_t values[ATOM_M];
-                    cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
-                        values[0], values[1], values[2], values[3]);
-                    cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
+                    cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
+                        values[0], values[1], values[2], values[3],
                         values[4], values[5], values[6], values[7]);
                     cutlass::arch::fence_view_async_tmem_load();
 
