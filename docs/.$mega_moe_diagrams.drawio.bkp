@@ -1,0 +1,1229 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/21.5.0 Chrome/112.0.5615.204 Electron/24.5.1 Safari/537.36" modified="2026-04-17T03:08:33.032Z" version="21.5.0" etag="6bkE1wx9xgjFowF4yPFB" type="device" pages="4">
+  <diagram id="overall-flow" name="① 整体运算流程">
+    <mxGraphModel dx="1242" dy="811" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="2400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="&lt;b&gt;DeepGEMM Mega MoE — 整体运算流程&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=20;" parent="1" vertex="1">
+          <mxGeometry x="400" y="10" width="800" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="input_group" value="Input Phase" style="swimlane;startSize=25;fillColor=#dae8fc;strokeColor=#6c8ebf;rounded=1;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="520" y="60" width="560" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="input_tokens" value="Input Tokens&lt;br&gt;(FP8 E4M3, per rank)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="input_group" vertex="1">
+          <mxGeometry x="20" y="30" width="240" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="topk_routing" value="TopK Routing&lt;br&gt;(topk_idx, topk_weights)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="input_group" vertex="1">
+          <mxGeometry x="300" y="30" width="240" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="mega_kernel_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#B85450;strokeWidth=3;dashed=1;dashPattern=8 4;" parent="1" vertex="1">
+          <mxGeometry x="80" y="160" width="1440" height="1720" as="geometry" />
+        </mxCell>
+        <mxCell id="mega_kernel_label" value="&lt;b&gt;单个 Mega Kernel (Persistent, All SMs)&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;fontSize=14;fontColor=#B85450;" parent="1" vertex="1">
+          <mxGeometry x="480" y="165" width="640" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="dispatch_group" value="Phase 1: EP Dispatch (NVLink Pull) — Dispatch Warps 0-3" style="swimlane;startSize=28;fillColor=#fff2cc;strokeColor=#d6b656;rounded=1;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="120" y="200" width="1360" height="380" as="geometry" />
+        </mxCell>
+        <mxCell id="count_tokens" value="1. Count Expert Tokens&lt;br&gt;&lt;i&gt;atomicAdd_block(smem_expert_count)&lt;/i&gt;&lt;br&gt;各 SM dispatch warps 并行读取 topk_idx" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="20" y="40" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="get_sm_offset" value="2. Get SM Offset&lt;br&gt;&lt;i&gt;ptx::atomic_add(expert_send_count)&lt;/i&gt;&lt;br&gt;计算每个 SM 在各 expert 中的偏移量" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="340" y="40" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="write_src_idx" value="3. Write Source Indices&lt;br&gt;&lt;i&gt;sym_buffer.map() NVLink 写入&lt;/i&gt;&lt;br&gt;将 token_topk_idx 写入远程 rank" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="660" y="40" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="grid_sync_1" value="4. Grid Sync&lt;br&gt;(intra-rank)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="990" y="35" width="140" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="write_expert_count" value="5. Write Expert Count to Remote&lt;br&gt;&lt;i&gt;SM 0: sym_buffer.map() → 远程 recv_count&lt;/i&gt;&lt;br&gt;&lt;i&gt;atomic_add_sys → recv_count_sum&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="20" y="130" width="320" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="nvl_barrier_1" value="6. NVLink Barrier&lt;br&gt;&lt;i&gt;Grid sync → Cross-rank signal&lt;/i&gt;&lt;br&gt;&lt;i&gt;→ Poll wait → Grid sync&lt;/i&gt;" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="400" y="120" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="pull_tokens" value="7. Pull Tokens via TMA&lt;br&gt;&lt;i&gt;tma_load_1d from remote rank&lt;/i&gt;&lt;br&gt;每个 dispatch warp 处理一组 tokens&lt;br&gt;Round-robin rank 选择 (负载均衡)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="20" y="230" width="300" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="store_sf_weights" value="8. Store SF + TopK Weights&lt;br&gt;&lt;i&gt;SF → l1_sf_buffer (UTCCP 布局)&lt;/i&gt;&lt;br&gt;&lt;i&gt;TopK weight → l1_topk_weights_buffer&lt;/i&gt;&lt;br&gt;&lt;i&gt;Token → tma_store_1d → l1_token_buffer&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="370" y="230" width="300" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_arrival" value="9. Signal L1 Arrival&lt;br&gt;&lt;i&gt;ptx::red_add_rel(l1_arrival_count)&lt;/i&gt;&lt;br&gt;per pool block 原子递增" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="720" y="240" width="260" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="token_metadata" value="10. Write TokenSrcMetadata&lt;br&gt;&lt;i&gt;{rank_idx, token_idx, topk_idx}&lt;/i&gt;&lt;br&gt;供 Combine 阶段路由使用" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="dispatch_group" vertex="1">
+          <mxGeometry x="1020" y="240" width="260" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="d_arrow1" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="count_tokens" target="get_sm_offset" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="d_arrow2" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="get_sm_offset" target="write_src_idx" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="d_arrow3" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="write_src_idx" target="grid_sync_1" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="d_arrow4" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="grid_sync_1" target="write_expert_count" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1180" y="110" />
+              <mxPoint x="1180" y="110" />
+              <mxPoint x="1200" y="110" />
+              <mxPoint x="1200" y="160" />
+              <mxPoint x="340" y="160" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="d_arrow5" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="write_expert_count" target="nvl_barrier_1" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="d_arrow6" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="nvl_barrier_1" target="pull_tokens" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="510" y="210" />
+              <mxPoint x="170" y="210" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="d_arrow7" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="pull_tokens" target="store_sf_weights" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="d_arrow8" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="store_sf_weights" target="l1_arrival" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="d_arrow9" style="edgeStyle=orthogonalEdgeStyle;" parent="dispatch_group" source="store_sf_weights" target="token_metadata" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="520" y="320" />
+              <mxPoint x="1150" y="320" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="linear1_group" value="Phase 2: Linear1 GEMM (FP8 x FP4) — TMA Warps 4-5, MMA Warp 6" style="swimlane;startSize=28;fillColor=#d5e8d4;strokeColor=#82b366;rounded=1;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="120" y="600" width="1360" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="wait_l1" value="Wait L1 Arrival&lt;br&gt;&lt;i&gt;while(ld_acq(l1_arrival_count)&lt;br&gt;!= expected)&lt;/i&gt;" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" parent="linear1_group" vertex="1">
+          <mxGeometry x="20" y="40" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="tma_load_a" value="TMA Load A (tokens + SFA)&lt;br&gt;&lt;i&gt;Warp 4: tma::copy&lt;/i&gt;&lt;br&gt;BLOCK_K × LOAD_BLOCK_M&lt;br&gt;Multicast on A (2-CTA)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="linear1_group" vertex="1">
+          <mxGeometry x="260" y="40" width="230" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="tma_load_b" value="TMA Load B (weights + SFB)&lt;br&gt;&lt;i&gt;Warp 5: tma::copy&lt;/i&gt;&lt;br&gt;BLOCK_K × LOAD_BLOCK_N&lt;br&gt;Expert-indexed" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="linear1_group" vertex="1">
+          <mxGeometry x="260" y="125" width="230" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="utccp_sf" value="UTCCP SF → TMEM&lt;br&gt;&lt;i&gt;SM100_UTCCP_4x32dp128bit_2cta&lt;/i&gt;&lt;br&gt;SFA → kTmemStartColOfSFA&lt;br&gt;SFB → kTmemStartColOfSFB" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="linear1_group" vertex="1">
+          <mxGeometry x="540" y="50" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="umma_l1" value="UMMA Issue (Leader CTA only)&lt;br&gt;&lt;i&gt;SM100_MMA_MXF8F6F4_2x1SM_SS&lt;/i&gt;&lt;br&gt;M=256, N=BLOCK_M, K=32&lt;br&gt;&lt;b&gt;Swap A/B: weights=A, acts=B&lt;/b&gt;&lt;br&gt;Block-scaled with UE8M0 SF" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;fontStyle=0;" parent="linear1_group" vertex="1">
+          <mxGeometry x="850" y="40" width="280" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="pipeline_label" value="&lt;i&gt;K-loop: #pragma unroll 2&lt;br&gt;Pipeline: kNumStages stages&lt;br&gt;full/empty barriers&lt;/i&gt;" style="text;html=1;align=left;fontSize=10;fontColor=#666666;" parent="linear1_group" vertex="1">
+          <mxGeometry x="860" y="145" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_arrow1" style="edgeStyle=orthogonalEdgeStyle;" parent="linear1_group" source="wait_l1" target="tma_load_a" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_arrow2" style="edgeStyle=orthogonalEdgeStyle;" parent="linear1_group" source="tma_load_a" target="utccp_sf" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_arrow3" style="edgeStyle=orthogonalEdgeStyle;" parent="linear1_group" source="utccp_sf" target="umma_l1" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="swiglu_group" value="Phase 3: SwiGLU Epilogue (L1) — Epilogue Warps 8-15" style="swimlane;startSize=28;fillColor=#e1d5e7;strokeColor=#9673a6;rounded=1;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="120" y="850" width="1360" height="310" as="geometry" />
+        </mxCell>
+        <mxCell id="tmem_load_l1" value="1. TMEM Load&lt;br&gt;&lt;i&gt;SM100_TMEM_LOAD_16dp256b1x&lt;/i&gt;&lt;br&gt;8 × FP32 values per atom&lt;br&gt;Gate/Up interleaved pairs:&lt;br&gt;(v0,v2), (v1,v3), (v4,v6), (v5,v7)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" parent="swiglu_group" vertex="1">
+          <mxGeometry x="20" y="40" width="250" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="clamp_swiglu" value="2. Activation Clamp + SwiGLU&lt;br&gt;&lt;i&gt;gate = clamp(gate, ±clamp_val)&lt;/i&gt;&lt;br&gt;&lt;i&gt;up = clamp(up, ±clamp_val)&lt;/i&gt;&lt;br&gt;&lt;i&gt;out = silu(gate) × up × topk_weight&lt;/i&gt;&lt;br&gt;&lt;i&gt;Optional: __expf + fast_rcp&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" parent="swiglu_group" vertex="1">
+          <mxGeometry x="310" y="40" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="amax_reduce" value="3. Cross-warp Amax Reduce&lt;br&gt;&lt;i&gt;warp_reduce&lt;4, true&gt;(|val|, Max)&lt;/i&gt;&lt;br&gt;→ smem_amax_reduction&lt;br&gt;→ 跨 warp pair 归约" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" parent="swiglu_group" vertex="1">
+          <mxGeometry x="610" y="40" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="fp8_cast" value="4. FP8 E4M3 Quantize&lt;br&gt;&lt;i&gt;get_e4m3_sf_and_sf_inv(amax)&lt;/i&gt;&lt;br&gt;&lt;i&gt;val × sf_inv → __nv_fp8x4_e4m3&lt;/i&gt;&lt;br&gt;STSM to smem_cd" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" parent="swiglu_group" vertex="1">
+          <mxGeometry x="890" y="40" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="store_l2_sf" value="5. Store L2 SF (UE8M0)&lt;br&gt;&lt;i&gt;MN-major layout&lt;/i&gt;&lt;br&gt;&lt;i&gt;→ l2_sf_buffer&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" parent="swiglu_group" vertex="1">
+          <mxGeometry x="20" y="165" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="tma_store_l1" value="6. TMA Store L1 Output&lt;br&gt;&lt;i&gt;SM90_TMA_STORE_2D&lt;/i&gt;&lt;br&gt;FP8 → l2_token_buffer&lt;br&gt;(2-stage TMA pipeline)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" parent="swiglu_group" vertex="1">
+          <mxGeometry x="260" y="160" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="signal_l2" value="7. Signal L2 Ready&lt;br&gt;&lt;i&gt;ptx::red_or_rel_gpu(&lt;/i&gt;&lt;br&gt;&lt;i&gt;  l2_arrival_mask,&lt;/i&gt;&lt;br&gt;&lt;i&gt;  1ULL &lt;&lt; n_block_idx)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" parent="swiglu_group" vertex="1">
+          <mxGeometry x="540" y="160" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s_arrow1" style="edgeStyle=orthogonalEdgeStyle;" parent="swiglu_group" source="tmem_load_l1" target="clamp_swiglu" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s_arrow2" style="edgeStyle=orthogonalEdgeStyle;" parent="swiglu_group" source="clamp_swiglu" target="amax_reduce" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s_arrow3" style="edgeStyle=orthogonalEdgeStyle;" parent="swiglu_group" source="amax_reduce" target="fp8_cast" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s_arrow4" style="edgeStyle=orthogonalEdgeStyle;" parent="swiglu_group" source="fp8_cast" target="store_l2_sf" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1140" y="145" />
+              <mxPoint x="120" y="145" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s_arrow5" style="edgeStyle=orthogonalEdgeStyle;" parent="swiglu_group" source="fp8_cast" target="tma_store_l1" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1005" y="145" />
+              <mxPoint x="380" y="145" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="s_arrow6" style="edgeStyle=orthogonalEdgeStyle;" parent="swiglu_group" source="tma_store_l1" target="signal_l2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="linear2_group" value="Phase 4: Linear2 GEMM (FP8 x FP4) — TMA Warps 4-5, MMA Warp 6" style="swimlane;startSize=28;fillColor=#d5e8d4;strokeColor=#82b366;rounded=1;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="120" y="1180" width="1360" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="wait_l2" value="Wait L2 Arrival Mask&lt;br&gt;&lt;i&gt;检查 2 个 L1 blocks 就绪:&lt;/i&gt;&lt;br&gt;&lt;i&gt;(mask &amp; needed) == needed&lt;/i&gt;&lt;br&gt;per K-block 粒度" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" parent="linear2_group" vertex="1">
+          <mxGeometry x="20" y="40" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="tma_load_l2" value="TMA Load L2 A + B + SF&lt;br&gt;&lt;i&gt;A: l2_acts (FP8 from L1 output)&lt;/i&gt;&lt;br&gt;&lt;i&gt;B: l2_weights (FP4)&lt;/i&gt;&lt;br&gt;&lt;i&gt;Shape: [M_tokens, intermediate_hidden]&lt;/i&gt;&lt;br&gt;&lt;i&gt;× [hidden, intermediate_hidden]&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="linear2_group" vertex="1">
+          <mxGeometry x="290" y="40" width="280" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="umma_l2" value="UMMA Issue (same as L1)&lt;br&gt;&lt;i&gt;SM100_MMA_MXF8F6F4_2x1SM_SS&lt;/i&gt;&lt;br&gt;Output: FP32 in TMEM accumulator" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="linear2_group" vertex="1">
+          <mxGeometry x="620" y="50" width="270" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="tmem_load_l2" value="TMEM Load + BF16 Cast&lt;br&gt;&lt;i&gt;SM100_TMEM_LOAD_16dp256b1x&lt;/i&gt;&lt;br&gt;&lt;i&gt;cast_into_bf16_and_pack()&lt;/i&gt;&lt;br&gt;&lt;i&gt;SM90_U32x4_STSM_T → smem_cd_l2&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" parent="linear2_group" vertex="1">
+          <mxGeometry x="940" y="45" width="280" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="l2_arrow1" style="edgeStyle=orthogonalEdgeStyle;" parent="linear2_group" source="wait_l2" target="tma_load_l2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="l2_arrow2" style="edgeStyle=orthogonalEdgeStyle;" parent="linear2_group" source="tma_load_l2" target="umma_l2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="l2_arrow3" style="edgeStyle=orthogonalEdgeStyle;" parent="linear2_group" source="umma_l2" target="tmem_load_l2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="combine_group" value="Phase 5: EP Combine (NVLink Push + Reduce) — Epilogue Warps 8-15" style="swimlane;startSize=28;fillColor=#dae8fc;strokeColor=#6c8ebf;rounded=1;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="120" y="1400" width="1360" height="370" as="geometry" />
+        </mxCell>
+        <mxCell id="nvl_write" value="1. NVLink Write to Remote&lt;br&gt;&lt;i&gt;Read smem_cd_l2 (BF16)&lt;/i&gt;&lt;br&gt;&lt;i&gt;Read TokenSrcMetadata&lt;/i&gt;&lt;br&gt;&lt;i&gt;sym_buffer.map(dst_ptr, dst_rank)&lt;/i&gt;&lt;br&gt;&lt;i&gt;= packed (float4 store)&lt;/i&gt;&lt;br&gt;路由: rank_idx / token_idx / topk_idx" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" parent="combine_group" vertex="1">
+          <mxGeometry x="20" y="40" width="290" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="nvl_barrier_2" value="2. NVLink Barrier&lt;br&gt;&lt;i&gt;cross-rank sync&lt;/i&gt;&lt;br&gt;~4 us" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" parent="combine_group" vertex="1">
+          <mxGeometry x="350" y="50" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="dispatch_clean" value="3. Dispatch Warps: Clean Workspace&lt;br&gt;&lt;i&gt;(overlapped with combine)&lt;/i&gt;&lt;br&gt;Clear expert_send_count, recv_count,&lt;br&gt;l1_arrival, l2_arrival_mask" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" parent="combine_group" vertex="1">
+          <mxGeometry x="570" y="45" width="280" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="combine_load" value="4. TMA Load Top-K Chunks&lt;br&gt;&lt;i&gt;Double-buffered pipeline&lt;/i&gt;&lt;br&gt;&lt;i&gt;(2 load stages + 1 store)&lt;/i&gt;&lt;br&gt;Per-warp: 1 token per iteration&lt;br&gt;&lt;i&gt;kNumChunks = 1 or 2&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" parent="combine_group" vertex="1">
+          <mxGeometry x="20" y="180" width="280" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="fp32_accum" value="5. FP32 Accumulation&lt;br&gt;&lt;i&gt;for each top-k slot:&lt;/i&gt;&lt;br&gt;&lt;i&gt;  reduced[j] += bf16_to_fp32(chunk)&lt;/i&gt;&lt;br&gt;&lt;i&gt;ptx::accumulate()&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" parent="combine_group" vertex="1">
+          <mxGeometry x="350" y="185" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="cast_store" value="6. Cast BF16 + TMA Store&lt;br&gt;&lt;i&gt;__float22bfloat162_rn()&lt;/i&gt;&lt;br&gt;&lt;i&gt;→ combine_store_buffer (smem)&lt;/i&gt;&lt;br&gt;&lt;i&gt;→ ptx::tma_store_1d(y)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" parent="combine_group" vertex="1">
+          <mxGeometry x="660" y="185" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="nvl_barrier_3" value="7. NVLink Barrier&lt;br&gt;&lt;i&gt;(workspace clean sync)&lt;/i&gt;" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" parent="combine_group" vertex="1">
+          <mxGeometry x="980" y="195" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="c_arrow1" style="edgeStyle=orthogonalEdgeStyle;" parent="combine_group" source="nvl_write" target="nvl_barrier_2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c_arrow2" style="edgeStyle=orthogonalEdgeStyle;" parent="combine_group" source="nvl_barrier_2" target="combine_load" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="440" y="150" />
+              <mxPoint x="160" y="150" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="c_arrow3" style="edgeStyle=orthogonalEdgeStyle;" parent="combine_group" source="combine_load" target="fp32_accum" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c_arrow4" style="edgeStyle=orthogonalEdgeStyle;" parent="combine_group" source="fp32_accum" target="cast_store" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c_arrow5" style="edgeStyle=orthogonalEdgeStyle;" parent="combine_group" source="dispatch_clean" target="nvl_barrier_3" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="710" y="145" />
+              <mxPoint x="1070" y="145" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="output" value="&lt;b&gt;Output y&lt;/b&gt;&lt;br&gt;(BF16, [num_tokens, hidden], per rank)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="600" y="1800" width="400" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="input_to_dispatch" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;" parent="1" source="input_tokens" target="count_tokens" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="660" y="155" />
+              <mxPoint x="280" y="155" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="topk_to_dispatch" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;" parent="1" source="topk_routing" target="count_tokens" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="940" y="155" />
+              <mxPoint x="280" y="155" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="arrival_to_l1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#82b366;strokeWidth=2;dashed=1;" parent="1" source="l1_arrival" target="wait_l1" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_to_swiglu" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;" parent="1" source="umma_l1" target="tmem_load_l1" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="swiglu_to_l2" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#b85450;strokeWidth=2;dashed=1;" parent="1" source="signal_l2" target="wait_l2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="l2_to_combine" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;" parent="1" source="tmem_load_l2" target="nvl_write" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="combine_to_output" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;" parent="1" source="cast_store" target="output" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="overlap_note1" value="&lt;i&gt;通信-计算重叠:&lt;br&gt;Dispatch warps 拉取 token 时,&lt;br&gt;GEMM warps 处理已就绪 blocks&lt;/i&gt;" style="shape=callout;whiteSpace=wrap;html=1;perimeter=calloutPerimeter;size=10;position=0.5;fillColor=#FFF3E0;strokeColor=#E65100;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1100" y="540" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="overlap_note2" value="&lt;i&gt;Dispatch clean 与 Combine reduce&lt;br&gt;通过 DispatchWithEpilogueBarrier 同步&lt;/i&gt;" style="shape=callout;whiteSpace=wrap;html=1;perimeter=calloutPerimeter;size=10;position=0.5;fillColor=#FFF3E0;strokeColor=#E65100;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="920" y="1745" width="260" height="50" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="warp-timeline" name="② Warp 时序">
+    <mxGraphModel dx="1242" dy="811" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="&lt;b&gt;Mega MoE — Warp 角色分配与并行执行时间线 (per SM, per CTA)&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=18;" parent="1" vertex="1">
+          <mxGeometry x="300" y="10" width="1200" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333333;strokeWidth=1;" parent="1" vertex="1">
+          <mxGeometry x="20" y="50" width="240" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_title" value="&lt;b&gt;Thread Layout (512 threads)&lt;/b&gt;" style="text;html=1;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="30" y="55" width="220" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="legend1" value="" style="rounded=0;fillColor=#fff2cc;strokeColor=#d6b656;" parent="1" vertex="1">
+          <mxGeometry x="30" y="80" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="legend1t" value="Dispatch Warps 0-3 (128T, 48 regs)" style="text;html=1;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="55" y="78" width="200" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="legend2" value="" style="rounded=0;fillColor=#d5e8d4;strokeColor=#82b366;" parent="1" vertex="1">
+          <mxGeometry x="30" y="100" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="legend2t" value="TMA Load Warp A (Warp 4, 40 regs)" style="text;html=1;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="55" y="98" width="200" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="legend3" value="" style="rounded=0;fillColor=#B3E5FC;strokeColor=#0288D1;" parent="1" vertex="1">
+          <mxGeometry x="30" y="120" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="legend3t" value="TMA Load Warp B (Warp 5, 40 regs)" style="text;html=1;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="55" y="118" width="200" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="legend4" value="" style="rounded=0;fillColor=#FFCCBC;strokeColor=#BF360C;" parent="1" vertex="1">
+          <mxGeometry x="30" y="140" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="legend4t" value="MMA Issue Warp (Warp 6, 40 regs)" style="text;html=1;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="55" y="138" width="200" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="legend5" value="" style="rounded=0;fillColor=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
+          <mxGeometry x="30" y="160" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="legend5t" value="Epilogue Warps 8-15 (256T, 208 regs)" style="text;html=1;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="55" y="158" width="200" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="legend6" value="" style="rounded=0;fillColor=#f8cecc;strokeColor=#b85450;" parent="1" vertex="1">
+          <mxGeometry x="30" y="180" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="legend6t" value="Sync / Barrier (Grid / NVLink)" style="text;html=1;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="55" y="178" width="200" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="legend7" value="" style="rounded=0;fillColor=#C8E6C9;strokeColor=#388E3C;" parent="1" vertex="1">
+          <mxGeometry x="30" y="200" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="legend7t" value="Reserved / Idle (Warp 7)" style="text;html=1;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="55" y="198" width="200" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="time_axis" value="" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" edge="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="300" y="240" as="sourcePoint" />
+            <mxPoint x="1740" y="240" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="time_label" value="&lt;b&gt;Time →&lt;/b&gt;" style="text;html=1;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="1740" y="228" width="60" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="tm0" value="t0" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="300" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="tm1" value="t1" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="420" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="tm2" value="t2" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="540" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="tm3" value="t3" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="700" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="tm4" value="t4" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="960" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="tm5" value="t5" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="1140" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="tm6" value="t6" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="1340" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="tm7" value="t7" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="1500" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="tm8" value="t8" style="text;html=1;fontSize=9;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="1700" y="243" width="25" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="phase1_label" value="&lt;b&gt;Phase 1: Dispatch&lt;/b&gt;" style="text;html=1;align=center;fontSize=11;fontColor=#d6b656;" parent="1" vertex="1">
+          <mxGeometry x="300" y="225" width="240" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="phase2_label" value="&lt;b&gt;Phase 2: L1 GEMM&lt;/b&gt;" style="text;html=1;align=center;fontSize=11;fontColor=#82b366;" parent="1" vertex="1">
+          <mxGeometry x="540" y="225" width="260" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="phase3_label" value="&lt;b&gt;Phase 3: SwiGLU&lt;/b&gt;" style="text;html=1;align=center;fontSize=11;fontColor=#9673a6;" parent="1" vertex="1">
+          <mxGeometry x="780" y="225" width="180" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="phase4_label" value="&lt;b&gt;Phase 4: L2 GEMM&lt;/b&gt;" style="text;html=1;align=center;fontSize=11;fontColor=#82b366;" parent="1" vertex="1">
+          <mxGeometry x="960" y="225" width="200" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="phase5_label" value="&lt;b&gt;Phase 5: Combine&lt;/b&gt;" style="text;html=1;align=center;fontSize=11;fontColor=#6c8ebf;" parent="1" vertex="1">
+          <mxGeometry x="1340" y="225" width="360" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="row_dispatch" value="&lt;b&gt;Dispatch&lt;br&gt;Warps 0-3&lt;/b&gt;" style="text;html=1;align=right;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="200" y="268" width="90" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="row_tma_a" value="&lt;b&gt;TMA A&lt;br&gt;Warp 4&lt;/b&gt;" style="text;html=1;align=right;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="200" y="328" width="90" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="row_tma_b" value="&lt;b&gt;TMA B&lt;br&gt;Warp 5&lt;/b&gt;" style="text;html=1;align=right;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="200" y="388" width="90" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="row_mma" value="&lt;b&gt;MMA Issue&lt;br&gt;Warp 6&lt;/b&gt;" style="text;html=1;align=right;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="200" y="448" width="90" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="row_idle" value="&lt;i&gt;Reserved&lt;br&gt;Warp 7&lt;/i&gt;" style="text;html=1;align=right;fontSize=11;fontColor=#999;" parent="1" vertex="1">
+          <mxGeometry x="200" y="508" width="90" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="row_epilogue" value="&lt;b&gt;Epilogue&lt;br&gt;Warps 8-15&lt;/b&gt;" style="text;html=1;align=right;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="200" y="568" width="90" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_count" value="Count Tokens" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="300" y="270" width="90" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_offset" value="SM Offset" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="395" y="270" width="60" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_src" value="Write Src Idx" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="460" y="270" width="80" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_gsync" value="Grid&lt;br&gt;Sync" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="545" y="270" width="45" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_wcount" value="Write Count" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="595" y="270" width="65" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_nvl1" value="NVLink&lt;br&gt;Barrier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="665" y="270" width="55" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_pull" value="Pull Remote Tokens (TMA via NVLink)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="725" y="270" width="420" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_barrier" value="Barrier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="1345" y="270" width="55" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_clean" value="Clean Workspace" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="1405" y="270" width="160" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="dw_nvl3" value="NVL&lt;br&gt;Barrier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="1570" y="270" width="50" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="ta_wait" value="Wait Expert&lt;br&gt;Count" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="300" y="330" width="420" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="ta_l1_load" value="L1 TMA Load A + SFA (pipelined)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="725" y="330" width="240" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="ta_l2_load" value="L2 TMA Load A + SFA" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="970" y="330" width="185" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="tb_wait" value="Wait" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="300" y="390" width="420" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="tb_l1_load" value="L1 TMA Load B + SFB (pipelined)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#B3E5FC;strokeColor=#0288D1;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="725" y="390" width="240" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="tb_l2_load" value="L2 TMA Load B + SFB" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#B3E5FC;strokeColor=#0288D1;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="970" y="390" width="185" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="mma_wait" value="Wait (fetch_expert_recv_count)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="300" y="450" width="480" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="mma_l1" value="L1 UMMA Issue (MXF8F6F4_2x1SM)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCCBC;strokeColor=#BF360C;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="785" y="450" width="180" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="mma_l2" value="L2 UMMA Issue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCCBC;strokeColor=#BF360C;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="1005" y="450" width="150" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="idle_bar" value="Idle (40 registers reserved)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=9;fontStyle=2;" parent="1" vertex="1">
+          <mxGeometry x="300" y="510" width="1320" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="ep_wait" value="Wait (barrier + fetch count)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="300" y="570" width="560" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="ep_swiglu" value="L1 SwiGLU + FP8 Cast + TMA Store" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="865" y="570" width="240" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="ep_l2" value="L2 BF16 Cast + NVLink Write" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="1110" y="570" width="230" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="ep_nvl2" value="NVL&lt;br&gt;Barrier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="1345" y="570" width="55" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="ep_combine" value="Combine Reduce + TMA Store" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;" parent="1" vertex="1">
+          <mxGeometry x="1405" y="570" width="215" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="overlap1" value="" style="endArrow=none;dashed=1;strokeColor=#E65100;strokeWidth=2;" parent="1" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="725" y="260" as="sourcePoint" />
+            <mxPoint x="725" y="620" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="overlap1_label" value="&lt;i&gt;通信-计算重叠开始&lt;/i&gt;" style="text;html=1;fontSize=9;fontColor=#E65100;rotation=-90;" parent="1" vertex="1">
+          <mxGeometry x="660" y="430" width="120" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="overlap2" value="" style="endArrow=none;dashed=1;strokeColor=#E65100;strokeWidth=2;" parent="1" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1345" y="260" as="sourcePoint" />
+            <mxPoint x="1345" y="620" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="overlap2_label" value="&lt;i&gt;NVLink Barrier&lt;/i&gt;" style="text;html=1;fontSize=9;fontColor=#E65100;rotation=-90;" parent="1" vertex="1">
+          <mxGeometry x="1290" y="430" width="100" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="reg_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333;strokeWidth=1;" parent="1" vertex="1">
+          <mxGeometry x="20" y="640" width="280" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="reg_title" value="&lt;b&gt;Register Budget (per SM)&lt;/b&gt;" style="text;html=1;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="30" y="645" width="260" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="reg_detail" value="Dispatch Warps:    48 regs × 128 threads =  6,144&lt;br&gt;Non-epilogue:       40 regs × 128 threads =  5,120&lt;br&gt;Epilogue Warps:  208 regs × 256 threads = 53,248&lt;br&gt;─────────────────────────────────&lt;br&gt;&lt;b&gt;Total: 64,512 / 65,536&lt;/b&gt;&lt;br&gt;&lt;br&gt;Using warpgroup_reg_dealloc/alloc&lt;br&gt;to dynamically redistribute registers&lt;br&gt;across heterogeneous warp roles." style="text;html=1;fontSize=10;align=left;" parent="1" vertex="1">
+          <mxGeometry x="30" y="670" width="260" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="sched_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333;strokeWidth=1;" parent="1" vertex="1">
+          <mxGeometry x="320" y="640" width="400" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="sched_title" value="&lt;b&gt;MegaMoEScheduler: Wave-based 两阶段调度&lt;/b&gt;" style="text;html=1;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="330" y="645" width="380" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="sched_detail" value="for each wave (kNumExpertsPerWave experts):&lt;br&gt;  │&lt;br&gt;  ├─ Phase L1: all (expert × m_block × n_block)&lt;br&gt;  │   block_idx += kNumSMs (round-robin)&lt;br&gt;  │   N blocks must be EVEN (2-CTA cluster)&lt;br&gt;  │&lt;br&gt;  └─ Phase L2: same experts, different shape&lt;br&gt;      block_idx += kNumSMs&lt;br&gt;&lt;br&gt;Expert count cached in per-lane registers&lt;br&gt;fetch_expert_recv_count() polls until all&lt;br&gt;kNumSMs × kNumRanks arrivals are observed" style="text;html=1;fontSize=10;align=left;" parent="1" vertex="1">
+          <mxGeometry x="330" y="668" width="380" height="145" as="geometry" />
+        </mxCell>
+        <mxCell id="barrier_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333;strokeWidth=1;" parent="1" vertex="1">
+          <mxGeometry x="740" y="640" width="360" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="barrier_title" value="&lt;b&gt;Barrier 类型汇总&lt;/b&gt;" style="text;html=1;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="750" y="645" width="340" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="barrier_detail" value="1. dispatch_barriers[]: TMA pull per-warp sync&lt;br&gt;2. full_barriers[]: TMA load → MMA ready (2×2 CTA)&lt;br&gt;3. empty_barriers[]: MMA → TMA reload (consumer)&lt;br&gt;4. tmem_full_barriers[]: MMA → epilogue TMEM ready&lt;br&gt;5. tmem_empty_barriers[]: epilogue → MMA TMEM free&lt;br&gt;6. combine_barriers[]: TMA load per-warp pipeline&lt;br&gt;7. grid_sync_count: intra-rank atomicAdd+XOR&lt;br&gt;8. nvl_barrier: cross-rank red_add_rel_sys + poll&lt;br&gt;9. l1_arrival_count: per-block token arrival&lt;br&gt;10. l2_arrival_mask: per-block bitmask (atomic OR)" style="text;html=1;fontSize=10;align=left;" parent="1" vertex="1">
+          <mxGeometry x="750" y="668" width="340" height="145" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="memory-hierarchy" name="③ 内存层级">
+    <mxGraphModel dx="1800" dy="1600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <!-- ======================== Title ======================== -->
+        <mxCell id="title" value="&lt;b&gt;Mega MoE — 数据流与内存层级&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=20;" vertex="1" parent="1">
+          <mxGeometry x="450" y="10" width="900" height="35" as="geometry" />
+        </mxCell>
+        <!-- ======================== Remote Rank (NVLink) ======================== -->
+        <mxCell id="remote_group" value="Remote Ranks (via NVLink + Symmetric Memory)" style="swimlane;startSize=28;fillColor=#FFECB3;strokeColor=#FF8F00;rounded=1;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="60" width="420" height="400" as="geometry" />
+        </mxCell>
+        <mxCell id="remote_input_tokens" value="&lt;b&gt;Input Token Buffer&lt;/b&gt;&lt;br&gt;(FP8 E4M3)&lt;br&gt;[num_max_tokens, hidden]&lt;br&gt;&lt;i&gt;per rank, remote accessible&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFECB3;strokeColor=#FF8F00;fontSize=10;" vertex="1" parent="remote_group">
+          <mxGeometry x="20" y="40" width="380" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="remote_input_sf" value="&lt;b&gt;Input SF Buffer&lt;/b&gt;&lt;br&gt;(UE8M0, K-major)&lt;br&gt;[num_max_tokens, hidden/128]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFECB3;strokeColor=#FF8F00;fontSize=10;" vertex="1" parent="remote_group">
+          <mxGeometry x="20" y="110" width="380" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="remote_topk_idx" value="&lt;b&gt;TopK Index Buffer&lt;/b&gt;&lt;br&gt;(int64)&lt;br&gt;[num_max_tokens, num_topk]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFECB3;strokeColor=#FF8F00;fontSize=10;" vertex="1" parent="remote_group">
+          <mxGeometry x="20" y="170" width="380" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="remote_topk_weights" value="&lt;b&gt;TopK Weights Buffer&lt;/b&gt;&lt;br&gt;(FP32)&lt;br&gt;[num_max_tokens, num_topk]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFECB3;strokeColor=#FF8F00;fontSize=10;" vertex="1" parent="remote_group">
+          <mxGeometry x="20" y="230" width="380" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="remote_combine" value="&lt;b&gt;Combine Token Buffer&lt;/b&gt;&lt;br&gt;(BF16)&lt;br&gt;[num_topk, num_max_tokens, hidden×2B]&lt;br&gt;&lt;i&gt;L2 results written here via NVLink&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE0B2;strokeColor=#E65100;fontSize=10;" vertex="1" parent="remote_group">
+          <mxGeometry x="20" y="300" width="380" height="70" as="geometry" />
+        </mxCell>
+        <!-- ======================== Local HBM / Symmetric Memory ======================== -->
+        <mxCell id="local_group" value="Local HBM (Symmetric Memory Buffers)" style="swimlane;startSize=28;fillColor=#E8F5E9;strokeColor=#2E7D32;rounded=1;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="480" y="60" width="480" height="880" as="geometry" />
+        </mxCell>
+        <mxCell id="workspace" value="&lt;b&gt;Workspace&lt;/b&gt;&lt;br&gt;• Grid sync counters (4 × uint32)&lt;br&gt;• NVLink barrier counter + signals&lt;br&gt;• Expert send count (num_experts × uint64)&lt;br&gt;• Expert recv count (ranks × experts × uint64)&lt;br&gt;• Expert recv count sum (per-rank × uint64)&lt;br&gt;• L1 arrival count (pool_blocks × uint32)&lt;br&gt;• L2 arrival mask (pool_blocks × uint64)&lt;br&gt;• Src token_topk_idx (dispatch routing)&lt;br&gt;• TokenSrcMetadata (combine routing)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=10;align=left;spacingLeft=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="40" width="440" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_token_pool" value="&lt;b&gt;L1 Token Pool&lt;/b&gt; (FP8 E4M3)&lt;br&gt;[num_max_pool_tokens, hidden]&lt;br&gt;&lt;i&gt;Pulled from remote ranks&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#2E7D32;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="220" width="440" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_sf_pool" value="&lt;b&gt;L1 SF Pool&lt;/b&gt; (UE8M0, MN-major, UTCCP transposed)&lt;br&gt;[hidden/128, num_padded_sf_pool_tokens]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#2E7D32;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="280" width="440" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_topk_weights_pool" value="&lt;b&gt;L1 TopK Weights Pool&lt;/b&gt; (FP32)&lt;br&gt;[num_max_pool_tokens]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#2E7D32;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="335" width="440" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="l2_token_pool" value="&lt;b&gt;L2 Activation Pool&lt;/b&gt; (FP8 E4M3)&lt;br&gt;[num_max_pool_tokens, intermediate_hidden]&lt;br&gt;&lt;i&gt;L1 SwiGLU output → L2 input&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="395" width="440" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="l2_sf_pool" value="&lt;b&gt;L2 SF Pool&lt;/b&gt; (UE8M0, MN-major)&lt;br&gt;[intermediate_hidden/128, num_padded_sf_pool_tokens]&lt;br&gt;&lt;i&gt;Computed inline during L1 epilogue&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="460" width="440" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_weights" value="&lt;b&gt;L1 Expert Weights&lt;/b&gt; (FP4 E2M1, K-major)&lt;br&gt;[num_experts_per_rank, intermediate_hidden×2, hidden/2]&lt;br&gt;&lt;i&gt;Gate/Up interleaved: [g0..7, u0..7, g8..15, ...]&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCEDC8;strokeColor=#558B2F;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="540" width="440" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="l1_weights_sf" value="&lt;b&gt;L1 Weight SF&lt;/b&gt; (UE8M0 packed, MN-major, UTCCP transposed)&lt;br&gt;[num_experts_per_rank, intermediate_hidden×2, hidden/32]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCEDC8;strokeColor=#558B2F;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="610" width="440" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="l2_weights" value="&lt;b&gt;L2 Expert Weights&lt;/b&gt; (FP4 E2M1, K-major)&lt;br&gt;[num_experts_per_rank, hidden, intermediate_hidden/2]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCEDC8;strokeColor=#558B2F;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="670" width="440" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="l2_weights_sf" value="&lt;b&gt;L2 Weight SF&lt;/b&gt; (UE8M0 packed, MN-major, UTCCP transposed)&lt;br&gt;[num_experts_per_rank, hidden, intermediate_hidden/32]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCEDC8;strokeColor=#558B2F;fontSize=10;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="730" width="440" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="output_y" value="&lt;b&gt;Output y&lt;/b&gt; (BF16)&lt;br&gt;[num_tokens, hidden]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#B2DFDB;strokeColor=#00695C;fontSize=11;fontStyle=1;" vertex="1" parent="local_group">
+          <mxGeometry x="20" y="810" width="440" height="45" as="geometry" />
+        </mxCell>
+        <!-- ======================== Shared Memory (per SM) ======================== -->
+        <mxCell id="smem_group" value="Shared Memory (per SM, ~228 KB)" style="swimlane;startSize=28;fillColor=#E3F2FD;strokeColor=#1565C0;rounded=1;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="60" width="380" height="530" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_expert_count" value="smem_expert_count&lt;br&gt;[NUM_EXPERTS × 4B]&lt;br&gt;(1024B aligned)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="35" width="350" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_send" value="smem_send_buffers&lt;br&gt;[kNumDispatchWarps × hidden B]&lt;br&gt;(dispatch TMA pull staging)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="82" width="350" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_cd" value="smem_cd (overlapped)&lt;br&gt;L1: FP8 [STORE_BM × BN/2] × 2 TMA stages&lt;br&gt;L2: BF16 [STORE_BM × BN] × 1 stage&lt;br&gt;max(L1, L2) allocated" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#90CAF9;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="130" width="350" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_a" value="smem_a[0..kNumStages-1]&lt;br&gt;[LOAD_BLOCK_M × BLOCK_K × sizeof(FP8)]&lt;br&gt;(pipelined token tiles)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#64B5F6;strokeColor=#1565C0;fontSize=10;fontColor=#FFF;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="198" width="350" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_b" value="smem_b[0..kNumStages-1]&lt;br&gt;[LOAD_BLOCK_N × BLOCK_K × sizeof(FP4)]&lt;br&gt;(pipelined weight tiles)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#64B5F6;strokeColor=#1565C0;fontSize=10;fontColor=#FFF;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="250" width="350" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_sf" value="smem_sfa[stages] + smem_sfb[stages]&lt;br&gt;SF_BLOCK_M/N × uint32 per stage" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#42A5F5;strokeColor=#1565C0;fontSize=10;fontColor=#FFF;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="303" width="350" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_amax" value="smem_amax_reduction&lt;br&gt;[STORE_BM × num_epilogue_warps/2 × float2]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="350" width="350" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_barriers" value="Barriers (ClusterTransactionBarrier)&lt;br&gt;dispatch + full/empty + tmem_full/empty + combine&lt;br&gt;(8 bytes each)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="398" width="350" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_tmem_ptr" value="tmem_ptr_in_smem (4B)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="455" width="350" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="smem_combine_note" value="&lt;i&gt;Combine 阶段复用 smem_cd 区域:&lt;br&gt;2 load stages + 1 store buffer per warp&lt;/i&gt;" style="text;html=1;fontSize=9;fontColor=#666;align=left;" vertex="1" parent="smem_group">
+          <mxGeometry x="15" y="492" width="350" height="30" as="geometry" />
+        </mxCell>
+        <!-- ======================== Tensor Memory ======================== -->
+        <mxCell id="tmem_group" value="Tensor Memory (TMEM, per 2-CTA cluster)" style="swimlane;startSize=28;fillColor=#FCE4EC;strokeColor=#C62828;rounded=1;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="620" width="380" height="320" as="geometry" />
+        </mxCell>
+        <mxCell id="tmem_alloc" value="&lt;b&gt;Allocator2Sm&lt;/b&gt;&lt;br&gt;(2-CTA cluster allocation)&lt;br&gt;32 ≤ kNumTmemCols ≤ 512" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#C62828;fontSize=10;" vertex="1" parent="tmem_group">
+          <mxGeometry x="15" y="35" width="350" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="tmem_accum" value="&lt;b&gt;Accumulator Columns&lt;/b&gt;&lt;br&gt;UMMA_N × kNumEpilogueStages (2)&lt;br&gt;= BLOCK_M × 2 columns&lt;br&gt;FP32, double-buffered" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8BBD0;strokeColor=#C62828;fontSize=10;" vertex="1" parent="tmem_group">
+          <mxGeometry x="15" y="90" width="350" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="tmem_sfa" value="&lt;b&gt;SFA Columns&lt;/b&gt;&lt;br&gt;SF_BLOCK_M / 32 columns&lt;br&gt;(UTCCP 4x32dp128bit copied from smem)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8BBD0;strokeColor=#C62828;fontSize=10;" vertex="1" parent="tmem_group">
+          <mxGeometry x="15" y="160" width="350" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="tmem_sfb" value="&lt;b&gt;SFB Columns&lt;/b&gt;&lt;br&gt;SF_BLOCK_N / 32 columns&lt;br&gt;(UTCCP 4x32dp128bit copied from smem)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8BBD0;strokeColor=#C62828;fontSize=10;" vertex="1" parent="tmem_group">
+          <mxGeometry x="15" y="220" width="350" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="tmem_note" value="&lt;i&gt;TMEM Load: SM100_TMEM_LOAD_16dp256b1x&lt;br&gt;UTCCP: SM100_UTCCP_4x32dp128bit_2cta&lt;/i&gt;" style="text;html=1;fontSize=9;fontColor=#666;align=left;" vertex="1" parent="tmem_group">
+          <mxGeometry x="15" y="278" width="350" height="30" as="geometry" />
+        </mxCell>
+        <!-- ======================== Data Flow Arrows ======================== -->
+        <!-- Dispatch: Remote → Local L1 Pool (NVLink Pull) -->
+        <mxCell id="arrow_nvl_pull" value="NVLink TMA Pull&lt;br&gt;&lt;i&gt;(Dispatch Warps)&lt;/i&gt;" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF8F00;strokeWidth=3;html=1;labelBackgroundColor=#FFF;" edge="1" source="remote_input_tokens" target="l1_token_pool" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="460" y="130" />
+              <mxPoint x="460" y="340" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="arrow_nvl_sf" value="SF copy via NVLink" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF8F00;strokeWidth=2;dashed=1;html=1;labelBackgroundColor=#FFF;fontSize=9;" edge="1" source="remote_input_sf" target="l1_sf_pool" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="460" y="210" />
+              <mxPoint x="460" y="382" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- L1 Pool → Shared Memory A (TMA) -->
+        <mxCell id="arrow_l1_tma_a" value="TMA Load" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#2E7D32;strokeWidth=2;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="l1_token_pool" target="smem_a" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- Weights → Shared Memory B (TMA) -->
+        <mxCell id="arrow_w_tma_b" value="TMA Load" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#558B2F;strokeWidth=2;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="l1_weights" target="smem_b" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- SF → Shared Memory SF (TMA) -->
+        <mxCell id="arrow_sf_tma" value="TMA Load SF" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#2E7D32;strokeWidth=2;dashed=1;html=1;labelBackgroundColor=#FFF;fontSize=9;" edge="1" source="l1_sf_pool" target="smem_sf" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="970" y="404" />
+              <mxPoint x="970" y="383" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Smem SF → TMEM SFA/SFB (UTCCP) -->
+        <mxCell id="arrow_utccp" value="UTCCP" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;strokeWidth=2;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="smem_sf" target="tmem_sfa" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1400" y="383" />
+              <mxPoint x="1400" y="620" />
+              <mxPoint x="1400" y="800" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Smem A/B → TMEM Accum (UMMA) -->
+        <mxCell id="arrow_umma" value="UMMA MXF8F6F4&lt;br&gt;2x1SM_SS" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;strokeWidth=3;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="smem_a" target="tmem_accum" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1400" y="281" />
+              <mxPoint x="1400" y="620" />
+              <mxPoint x="1400" y="740" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- TMEM Accum → Smem CD (TMEM Load) -->
+        <mxCell id="arrow_tmem_load" value="TMEM Load&lt;br&gt;(16dp256b1x)" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#1565C0;strokeWidth=2;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="tmem_accum" target="smem_cd" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1420" y="740" />
+              <mxPoint x="1420" y="610" />
+              <mxPoint x="1420" y="220" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Smem CD → L2 Token Pool (TMA Store, L1 epilogue) -->
+        <mxCell id="arrow_tma_store_l1" value="TMA Store&lt;br&gt;(L1 FP8 output)" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#1565C0;strokeWidth=2;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="smem_cd" target="l2_token_pool" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="980" y="220" />
+              <mxPoint x="980" y="495" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Smem CD → Remote Combine (NVLink Write, L2 epilogue) -->
+        <mxCell id="arrow_nvl_push" value="NVLink Write&lt;br&gt;&lt;i&gt;(L2 BF16 output)&lt;/i&gt;" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#E65100;strokeWidth=3;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="smem_cd" target="remote_combine" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1190" y="56" />
+              <mxPoint x="450" y="56" />
+              <mxPoint x="450" y="420" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Combine: Remote Combine → Smem (TMA Load) → Output y -->
+        <mxCell id="arrow_combine_load" value="TMA Load&lt;br&gt;(Combine top-k)" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#6c8ebf;strokeWidth=2;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="remote_combine" target="smem_cd" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="230" y="430" />
+              <mxPoint x="230" y="960" />
+              <mxPoint x="1190" y="960" />
+              <mxPoint x="1190" y="220" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="arrow_combine_store" value="TMA Store&lt;br&gt;(final output)" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#00695C;strokeWidth=3;html=1;labelBackgroundColor=#FFF;fontSize=10;" edge="1" source="smem_cd" target="output_y" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="990" y="220" />
+              <mxPoint x="990" y="930" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- ======================== Precision Summary ======================== -->
+        <mxCell id="prec_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="975" width="380" height="220" as="geometry" />
+        </mxCell>
+        <mxCell id="prec_title" value="&lt;b&gt;精度与数据类型总结&lt;/b&gt;" style="text;html=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1010" y="980" width="360" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="prec_table" value="&lt;table style=&#39;font-size:10px;border-collapse:collapse;width:100%&#39;&gt;&lt;tr&gt;&lt;th style=&#39;border:1px solid #999;padding:3px&#39;&gt;数据&lt;/th&gt;&lt;th style=&#39;border:1px solid #999;padding:3px&#39;&gt;类型&lt;/th&gt;&lt;th style=&#39;border:1px solid #999;padding:3px&#39;&gt;大小&lt;/th&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;Activations&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;FP8 E4M3&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;1 B/elem&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;Weights&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;FP4 E2M1&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;0.5 B/elem&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;Scale Factors&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;UE8M0 (packed)&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;1 B/group&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;Accumulator&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;FP32&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;4 B/elem&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;L1 Output&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;FP8 E4M3&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;1 B/elem&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;L2 Output&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;BF16&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;2 B/elem&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;Final Output&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;BF16&lt;/td&gt;&lt;td style=&#39;border:1px solid #999;padding:3px&#39;&gt;2 B/elem&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;" style="text;html=1;align=left;spacingLeft=5;" vertex="1" parent="1">
+          <mxGeometry x="1010" y="1005" width="360" height="185" as="geometry" />
+        </mxCell>
+        <!-- ======================== Block Size Summary ======================== -->
+        <mxCell id="block_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="480" y="975" width="480" height="220" as="geometry" />
+        </mxCell>
+        <mxCell id="block_title" value="&lt;b&gt;Block 尺寸配置 (默认)&lt;/b&gt;" style="text;html=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="490" y="980" width="460" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="block_detail" value="BLOCK_M = 192 | BLOCK_N = 128 | BLOCK_K = 128&lt;br&gt;LOAD_BLOCK_M = 96 (multicast on A, halved)&lt;br&gt;LOAD_BLOCK_N = 128&lt;br&gt;STORE_BLOCK_M = 32&lt;br&gt;SF_BLOCK_M = align(192, 128) = 256&lt;br&gt;SF_BLOCK_N = 128&lt;br&gt;&lt;br&gt;UMMA_M = 256 (2-CTA = LAYOUT_AD_M × 2)&lt;br&gt;UMMA_N = BLOCK_M = 192 (swap A/B)&lt;br&gt;UMMA_K = 32&lt;br&gt;&lt;br&gt;Swizzle: A=128B, B=128B (FP4 unpacked), CD=128B&lt;br&gt;Pipeline stages: dynamic (smem budget / per-stage cost)&lt;br&gt;Epilogue stages: 2 (TMEM double-buffer)&lt;br&gt;TMA store stages: 2 (L1 FP8 output)" style="text;html=1;fontSize=10;align=left;" vertex="1" parent="1">
+          <mxGeometry x="490" y="1005" width="460" height="185" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="barrier-mechanism" name="④ Warp Barrier 机制">
+    <mxGraphModel dx="1307" dy="854" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2400" pageHeight="3500" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="b_title" value="&lt;b&gt;Mega MoE — Warp 间 Barrier 机制全景&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=22;" parent="1" vertex="1">
+          <mxGeometry x="700" y="10" width="1000" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="b_subtitle" value="5 层作用域 · 14 类 barrier · 从 warp 内到跨 rank 的完整同步体系" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=13;fontStyle=2;fontColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="700" y="50" width="1000" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_title" value="① Barrier 作用域层级（金字塔）" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#1A237E;" parent="1" vertex="1">
+          <mxGeometry x="80" y="100" width="500" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1A237E;strokeWidth=2;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="80" y="140" width="1100" height="500" as="geometry" />
+        </mxCell>
+        <mxCell id="lvl5" value="&lt;b&gt;Cross-Rank (NVLink)&lt;/b&gt;&lt;br&gt;nvlink_barrier · ~4 μs · 3 次/kernel" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="100" y="170" width="1060" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lvl4" value="&lt;b&gt;Grid (all SMs intra-rank)&lt;/b&gt;&lt;br&gt;grid_sync (bit 31 翻转) · ~1.5 μs | l1_arrival_count / l2_arrival_mask (spin-wait)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="150" y="250" width="960" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="lvl3" value="&lt;b&gt;Cluster (2-CTA) / CTA (mbarrier)&lt;/b&gt;&lt;br&gt;full/empty · tmem_full/empty · dispatch · combine | mbarrier.arrive.expect_tx / try_wait.parity / tcgen05.commit" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="200" y="340" width="860" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="lvl2" value="&lt;b&gt;Block (Named Barrier, 16 HW slots)&lt;/b&gt;&lt;br&gt;bar.sync (aligned) / barrier.sync (unaligned) | id 0-4 分配给 Dispatch / Cross-role / Epi / WG" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="250" y="430" width="760" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lvl1" value="&lt;b&gt;Warp (32 lanes)&lt;/b&gt;&lt;br&gt;__syncwarp() · elect_one_sync · __shfl_sync · ~10 cycles" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="300" y="510" width="660" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="s1_note" value="颜色编码: 红=跨 GPU · 橙=跨 SM · 绿=Cluster 内 · 蓝=Block 内 · 紫=Warp 内&#xa;延迟: 顶层 ~4μs → 底层 &lt;10 cycles" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontStyle=2;fontColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="100" y="585" width="1060" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_title" value="② mbarrier 64-bit 状态字段（硬件级细节）" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#1A237E;" parent="1" vertex="1">
+          <mxGeometry x="1220" y="100" width="600" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s2_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1A237E;strokeWidth=2;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="1220" y="140" width="1100" height="500" as="geometry" />
+        </mxCell>
+        <mxCell id="bits_phase" value="&lt;b&gt;phase&lt;/b&gt;&lt;br&gt;1 bit" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="180" width="80" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="bits_arrive" value="&lt;b&gt;arrive count&lt;/b&gt;&lt;br&gt;15 bits · current / initial" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1320" y="180" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="bits_exp" value="&lt;b&gt;expected_tx&lt;/b&gt;&lt;br&gt;20 bits · TMA bytes to arrive" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1620" y="180" width="340" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="bits_pend" value="&lt;b&gt;pending_tx&lt;/b&gt;&lt;br&gt;20 bits · hardware auto-decrement" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1960" y="180" width="340" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="flip_cond" value="&lt;b&gt;翻相位条件 (barrier 完成):&lt;/b&gt;&lt;br&gt;arrive_count == 0   AND   pending_tx == expected_tx&lt;br&gt;→ phase ^= 1  ·  arrive_count ← initial  ·  expected_tx/pending_tx ← 0" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;strokeWidth=2;fontSize=12;align=center;" parent="1" vertex="1">
+          <mxGeometry x="1260" y="270" width="1020" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="ops_title" value="&lt;b&gt;Producer/Consumer 操作 &amp;amp; PTX&lt;/b&gt;" style="text;html=1;align=center;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="375" width="1060" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="op_init" value="&lt;b&gt;init(N)&lt;/b&gt;&lt;br&gt;mbarrier.init.shared.b64&lt;br&gt;设置 arrive_count=N, phase=0" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="405" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="op_arrive" value="&lt;b&gt;arrive()&lt;/b&gt;&lt;br&gt;mbarrier.arrive.shared.b64&lt;br&gt;arrive_count -= 1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1500" y="405" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="op_arr_tx" value="&lt;b&gt;arrive_and_expect_tx(B)&lt;/b&gt;&lt;br&gt;mbarrier.arrive.expect_tx&lt;br&gt;arrive_count-=1; expected_tx+=B" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1760" y="405" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="op_umma" value="&lt;b&gt;umma_arrive_multicast&lt;/b&gt;&lt;br&gt;tcgen05.commit.mbarrier::arrive&lt;br&gt;UMMA 完成后硬件 arrive (异步!)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="2030" y="405" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="op_tmacopy" value="&lt;b&gt;cp.async.bulk with bar&lt;/b&gt;&lt;br&gt;cp.async.bulk.mbarrier::complete_tx::bytes&lt;br&gt;TMA 硬件每送到 K 字节 pending_tx-=K" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="485" width="510" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="op_wait" value="&lt;b&gt;wait(phase)&lt;/b&gt;&lt;br&gt;mbarrier.try_wait.parity + spin loop&lt;br&gt;等 hardware phase == software phase，然后 software phase ^= 1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1760" y="485" width="530" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="why_phase" value="&lt;b&gt;为什么需要 Phase Bit？&lt;/b&gt; 避免 ABA 问题：persistent kernel 反复使用同一 barrier 槽位，仅靠 counter 无法区分&amp;quot;第 N 次使用&amp;quot;。&lt;br&gt;phase bit 让每轮 barrier 唯一化 — Consumer 维护 software phase，每 wait 一次翻转一次，与 hardware phase 同步比对。" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontStyle=0;fontColor=#333;strokeColor=#666;fillColor=#FFFFFF;rounded=1;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="570" width="1060" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s3_title" value="③ 单个 K-block 的完整 Barrier 握手时序（TMA-A · TMA-B · MMA · Epilogue 四角色）" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#1A237E;" parent="1" vertex="1">
+          <mxGeometry x="80" y="670" width="1200" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s3_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1A237E;strokeWidth=2;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="80" y="710" width="2240" height="780" as="geometry" />
+        </mxCell>
+        <mxCell id="r_tma_a" value="&lt;b&gt;TMA-A warp&lt;/b&gt;&lt;br&gt;(warp 4)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="770" width="140" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="r_tma_b" value="&lt;b&gt;TMA-B warp&lt;/b&gt;&lt;br&gt;(warp 5)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="880" width="140" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="r_mma" value="&lt;b&gt;MMA warp&lt;/b&gt;&lt;br&gt;(warp 6, leader CTA)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1000" width="140" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="r_epi" value="&lt;b&gt;Epilogue warps&lt;/b&gt;&lt;br&gt;(warp 8-15, 2 WGs)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1150" width="140" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="time_axis" value="time →" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=13;fontStyle=2;fontColor=#666666;" parent="1" vertex="1">
+          <mxGeometry x="260" y="735" width="80" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="ea1" value="empty_barriers[s].wait(phase^1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="260" y="780" width="210" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="ea2" value="tma::copy(tokens)&lt;br&gt;tma::copy(SFA)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="490" y="780" width="170" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="ea3" value="full_barriers[s].arrive_and_expect_tx(bytes)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="680" y="780" width="260" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="ea4" value="(continue next stage)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#999999;fontSize=10;fontStyle=2;" parent="1" vertex="1">
+          <mxGeometry x="960" y="780" width="180" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="eb1" value="empty_barriers[s].wait(phase^1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="260" y="890" width="210" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="eb2" value="tma::copy(weights)&lt;br&gt;tma::copy(SFB)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="490" y="890" width="170" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="eb3" value="full_barriers[s].arrive_and_expect_tx(bytes)&lt;br&gt;&lt;b&gt;⇒ count=0 AND tx 达成 → phase flip&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="680" y="880" width="340" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="em0" value="tmem_empty_barriers[e].wait(accum_phase^1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="260" y="980" width="280" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="em1" value="full_barriers[s].wait(phase)&lt;br&gt;&lt;i&gt;[等待 TMA 就绪]&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1030" y="980" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="em2" value="UTCCP: SFA/SFB → TMEM&lt;br&gt;SM100_MMA_MXF8F6F4_2x1SM::fma(...)&lt;br&gt;&lt;i&gt;[发射异步 UMMA]&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1260" y="975" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="em3" value="umma_arrive_multicast_2x1SM(empty_barriers[s])&lt;br&gt;(tcgen05.commit — UMMA 完成后硬件自动 arrive)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1560" y="975" width="360" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="em4" value="(last K) umma_arrive_multicast_2x1SM(tmem_full_barriers[e])" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1940" y="975" width="360" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ep1" value="tmem_full_barriers[e].wait(accum_phase)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1960" y="1130" width="260" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="ep2" value="TMEM_LOAD → SwiGLU + amax" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1960" y="1180" width="260" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="ep3" value="sync_aligned(128, WG-barrier id 3/4)&lt;br&gt;[WG 内 amax 归约]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1960" y="1220" width="260" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="ep4" value="STSM + TMA store (FP8 E4M3)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1960" y="1270" width="260" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="ep5" value="tmem_empty_barriers[e].arrive(0u)&lt;br&gt;&lt;b&gt;× 256 thread × 2 CTA = 512&lt;/b&gt;→ phase flip" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1960" y="1310" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ep6" value="red_or_rel_gpu(l2_arrival_mask, 1&amp;lt;&amp;lt;n_block)&lt;br&gt;→ 通知 L2 TMA-A 可读" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1960" y="1370" width="260" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="arr_ea3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#82B366;strokeWidth=2;dashed=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="ea3" target="em1" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="810" y="860" />
+              <mxPoint x="1140" y="860" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="arr_eb3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#82B366;strokeWidth=2;dashed=1;exitX=1;exitY=0.5;" parent="1" source="eb3" target="em1" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="arr_em3a" value="empty flip → next stage" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#B85450;strokeWidth=2;dashed=1;exitX=0;exitY=0;entryX=1;entryY=0.5;fontSize=10;" parent="1" source="em3" target="ea4" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="arr_em4" value="UMMA 完成" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#B85450;strokeWidth=2;dashed=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;fontSize=10;" parent="1" source="em4" target="ep1" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="arr_ep5" value="TMEM 释放" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#B85450;strokeWidth=2;dashed=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;fontSize=10;" parent="1" source="ep5" target="em0" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="s3_legend" value="&lt;b&gt;图例：&lt;/b&gt; 紫=wait · 蓝=TMA-A · 绿=TMA-B · 橙=MMA compute · 红=barrier arrive/flip · 黄=wait 被动阻塞&lt;br&gt;&lt;b&gt;关键观察：&lt;/b&gt;稳态流水线下，MMA/Epi 的 wait 通常不阻塞 — producer 已提前完成，consumer 到达时 phase 已就绪。" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontStyle=0;fontColor=#333;strokeColor=#666;fillColor=#FFFFCC;rounded=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1430" width="2200" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="s4_title" value="④ Block 级 Named Barrier 分配（16 个硬件槽位）" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#1A237E;" parent="1" vertex="1">
+          <mxGeometry x="80" y="1510" width="800" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s4_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1A237E;strokeWidth=2;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="80" y="1550" width="1100" height="530" as="geometry" />
+        </mxCell>
+        <mxCell id="nb0" value="&lt;b&gt;id 0&lt;/b&gt; · kDispatchBarrierIdx&lt;br&gt;bar.sync 0, 128&lt;br&gt;4 个 Dispatch warps (warp 0-3) 内部同步&lt;br&gt;&lt;i&gt;用途：smem_expert_count 归约、grid_sync 前后&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1580" width="520" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="nb1" value="&lt;b&gt;id 1&lt;/b&gt; · kDispatchWithEpilogueBarrierIdx &lt;span style=&quot;color:#B85450;&quot;&gt;[防死锁关键]&lt;/span&gt;&lt;br&gt;barrier.sync 1, 384 ← unaligned&lt;br&gt;128 Dispatch + 256 Epilogue = 384 线程&lt;br&gt;&lt;i&gt;用途：隔离 Dispatch pull 与 Combine reduce&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;align=left;strokeWidth=2;" parent="1" vertex="1">
+          <mxGeometry x="640" y="1580" width="520" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="nb2" value="&lt;b&gt;id 2&lt;/b&gt; · kEpilogueFullBarrierIdx&lt;br&gt;bar.sync 2, 256&lt;br&gt;8 个 Epilogue warps 全局同步&lt;br&gt;&lt;i&gt;用途：TMA store 完成后、切换下一块之前&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1690" width="520" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="nb34" value="&lt;b&gt;id 3, 4&lt;/b&gt; · kEpilogueWGBarrierStartIdx + wg&lt;br&gt;bar.sync 3, 128 / bar.sync 4, 128&lt;br&gt;每个 Epilogue Warp Group (4 warps = 128T) 独立&lt;br&gt;&lt;i&gt;用途：WG 内 amax 归约、smem_cd 读写序&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="640" y="1690" width="520" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="nb_aligned_title" value="&lt;b&gt;bar.sync vs barrier.sync&lt;/b&gt;" style="text;html=1;align=left;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1795" width="300" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="nb_aligned" value="&lt;b&gt;bar.sync (aligned)&lt;/b&gt;&lt;br&gt;线程数必须是 32 的倍数且连续&lt;br&gt;~30-50 cycles&lt;br&gt;&lt;i&gt;ptx::sync_aligned()&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1825" width="320" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="nb_unaligned" value="&lt;b&gt;barrier.sync (unaligned)&lt;/b&gt;&lt;br&gt;允许跨不连续 warp 分区&lt;br&gt;~50-100 cycles&lt;br&gt;&lt;i&gt;ptx::sync_unaligned()&lt;/i&gt;&lt;br&gt;&lt;b&gt;Mega MoE 中仅 id 1 使用&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFEBEE;strokeColor=#E53935;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="440" y="1825" width="320" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="nb_why_un" value="&lt;b&gt;为什么 id 1 必须 unaligned？&lt;/b&gt;&lt;br&gt;Dispatch warps = warp 0-3 (thread 0-127)&lt;br&gt;Epilogue warps = warp 8-15 (thread 256-511)&lt;br&gt;中间跳过了 warp 4-7 (TMA-A/B, MMA, idle)&lt;br&gt;→ 不是连续 thread 区间，必须 unaligned" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFDE7;strokeColor=#FBC02D;fontSize=10;align=left;" parent="1" vertex="1">
+          <mxGeometry x="780" y="1825" width="380" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="nb_deadlock_title" value="&lt;b&gt;id 1 防止的死锁场景&lt;/b&gt;" style="text;html=1;align=left;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1935" width="400" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="nb_deadlock" value="&lt;b&gt;t0:&lt;/b&gt; Dispatch warps 进入 cleanup，清零 l1_arrival_count | Epilogue 仍在读 combine_token_buffer 做 reduce&lt;br&gt;&lt;b&gt;t1:&lt;/b&gt; Persistent 下一轮开始，Dispatch 启动 Count Tokens；Epi 还在上一轮 reduce → 数据竞态读到脏数据&lt;br&gt;&lt;b&gt;t2:&lt;/b&gt; Cleanup 清了 Epi 尚未用完的元数据，Epi 读到非法值&lt;br&gt;&lt;b&gt;解：&lt;/b&gt; id 1 强制 Dispatch cleanup 必须等 Epi 的 combine reduce 结束" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFEBEE;strokeColor=#B85450;strokeWidth=2;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="100" y="1965" width="1060" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="s5_title" value="⑤ grid_sync 的 bit 31 翻转算法（148 SM 原子同步）" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#1A237E;" parent="1" vertex="1">
+          <mxGeometry x="1220" y="1510" width="800" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s5_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1A237E;strokeWidth=2;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="1220" y="1550" width="1100" height="530" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_state" value="&lt;b&gt;workspace.grid_sync_count[idx] (32-bit)&lt;/b&gt;" style="text;html=1;align=center;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="1580" width="1060" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_bit31" value="&lt;b&gt;bit 31&lt;/b&gt;&lt;br&gt;kFinishSumTag&lt;br&gt;= 0x80000000&lt;br&gt;finish tag (每轮翻转)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;strokeWidth=2;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="1610" width="150" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_bit030" value="&lt;b&gt;bit 30..0&lt;/b&gt; 累加计数器&lt;br&gt;SM 0 加 (kFinishSumTag - kNumSMs + 1)&lt;br&gt;其他 SM 每个加 1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;strokeWidth=2;" parent="1" vertex="1">
+          <mxGeometry x="1390" y="1610" width="890" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_algo_title" value="&lt;b&gt;算法（第 n 轮同步，kNumSMs=148）&lt;/b&gt;" style="text;html=1;align=left;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="1710" width="500" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_step1" value="&lt;b&gt;Step 1&lt;/b&gt; · 147 个非 leader SM 依次调用&lt;br&gt;old = atomic_add_rel(ptr, 1)&lt;br&gt;每次 +1，累加 147 次" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="1740" width="340" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_step2" value="&lt;b&gt;Step 2&lt;/b&gt; · SM 0 调用&lt;br&gt;old = atomic_add_rel(ptr, 0x80000000 - 147)&lt;br&gt;= 0x7FFFFF6D" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1590" y="1740" width="340" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_step3" value="&lt;b&gt;Step 3&lt;/b&gt; · 总和&lt;br&gt;147 + 0x7FFFFF6D = 0x80000000&lt;br&gt;bit 31 翻转!" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;align=left;strokeWidth=2;" parent="1" vertex="1">
+          <mxGeometry x="1940" y="1740" width="340" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_detect" value="&lt;b&gt;Step 4 · 每个 SM 自旋检测 bit 31 翻转&lt;/b&gt;&lt;br&gt;do { new = ld_acq(ptr); } while ( ((new ^ old) &amp;amp; 0x80000000) == 0 );&lt;br&gt;  ↑ old 是本 SM 调用前的值，new 是现在的值&lt;br&gt;  → 只要看到 bit 31 从 0 变 1 (或 1 变 0)，就说明所有 SM 都到了" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFDE7;strokeColor=#FBC02D;fontSize=11;align=left;strokeWidth=2;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="1840" width="1040" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="gs_advantage" value="&lt;b&gt;为什么不用 counter==N？&lt;/b&gt; persistent kernel 会多次调用 grid_sync。&lt;br&gt;用 counter 需要复杂的清零/phase 管理；用 bit 31 翻转让&lt;b&gt;每次同步都是新的 phase&lt;/b&gt;，自动避免 ABA，&lt;b&gt;无需清零&lt;/b&gt;。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1240" y="1955" width="1040" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s6_title" value="⑥ nvlink_barrier 的 ±1 交替 Signal 状态机（跨 GPU 同步）" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#1A237E;" parent="1" vertex="1">
+          <mxGeometry x="80" y="2100" width="800" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s6_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1A237E;strokeWidth=2;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="80" y="2140" width="2240" height="580" as="geometry" />
+        </mxCell>
+        <mxCell id="nvs_header" value="&lt;b&gt;counter.bit[1..0] 状态机 (4 状态循环)&lt;/b&gt;" style="text;html=1;align=center;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="2165" width="1060" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="nvs0" value="&lt;b&gt;State 0&lt;/b&gt;&lt;br&gt;phase=0, sign=0&lt;hr&gt;Signal: signal[0]&lt;br&gt;Add: +1&lt;br&gt;Target: counter == kNumRanks" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;strokeWidth=2;align=left;" parent="1" vertex="1">
+          <mxGeometry x="100" y="2200" width="230" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="nvs1" value="&lt;b&gt;State 1&lt;/b&gt;&lt;br&gt;phase=1, sign=0&lt;hr&gt;Signal: signal[1]&lt;br&gt;Add: +1&lt;br&gt;Target: counter == kNumRanks" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=11;strokeWidth=2;align=left;" parent="1" vertex="1">
+          <mxGeometry x="350" y="2200" width="230" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="nvs2" value="&lt;b&gt;State 2&lt;/b&gt;&lt;br&gt;phase=0, sign=1&lt;hr&gt;Signal: signal[0]&lt;br&gt;Add: -1&lt;br&gt;Target: counter == 0" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=11;strokeWidth=2;align=left;" parent="1" vertex="1">
+          <mxGeometry x="600" y="2200" width="230" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="nvs3" value="&lt;b&gt;State 3&lt;/b&gt;&lt;br&gt;phase=1, sign=1&lt;hr&gt;Signal: signal[1]&lt;br&gt;Add: -1&lt;br&gt;Target: counter == 0" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;strokeWidth=2;align=left;" parent="1" vertex="1">
+          <mxGeometry x="850" y="2200" width="230" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="nvt01" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#333333;strokeWidth=2;" parent="1" source="nvs0" target="nvs1" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="nvt12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#333333;strokeWidth=2;" parent="1" source="nvs1" target="nvs2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="nvt23" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#333333;strokeWidth=2;" parent="1" source="nvs2" target="nvs3" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="nvt30" value="counter++ wrap" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classicThin;strokeColor=#B85450;strokeWidth=2;dashed=1;fontSize=10;" parent="1" source="nvs3" target="nvs0" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_insight" value="&lt;b&gt;设计精髓：±1 交替让 signal 自然归零，无需清零指令&lt;/b&gt;&lt;br&gt;&lt;br&gt;• State 0 结束后 signal[0] = kNumRanks (每个 rank 各加 +1)&lt;br&gt;• State 2 开始用 signal[0] 减 1: signal[0] kNumRanks → 0&lt;br&gt;• 同时 signal[1] 是 phase=1 的 barrier 在使用，两个槽位轮换避免 ABA&lt;br&gt;• counter 自增只在 SM 0 发生，其他 SM 不关心这个 counter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFDE7;strokeColor=#FBC02D;fontSize=12;strokeWidth=2;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1130" y="2200" width="600" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_3stage_title" value="&lt;b&gt;nvlink_barrier 的 3 阶段结构&lt;/b&gt;" style="text;html=1;align=left;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="2355" width="500" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_pre" value="&lt;b&gt;Stage 1: Pre grid_sync (可选)&lt;/b&gt;&lt;br&gt;• 确保 local rank 所有 SM 到达&lt;br&gt;• 没有正在 pending 的 read/write&lt;br&gt;&lt;i&gt;[sync_prologue=true]&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="100" y="2385" width="520" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_mid" value="&lt;b&gt;Stage 2: Cross-rank 握手（仅 SM 0）&lt;/b&gt;&lt;br&gt;• thread i (i &amp;lt; kNumRanks): red_add_rel_sys(signal, ±1) to rank i&lt;br&gt;• thread 0: spin wait signal 达到目标值 (0 或 kNumRanks)&lt;br&gt;• 30 秒 timeout (2 GHz × 60G cycles) → DG_DEVICE_ASSERT" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;strokeWidth=2;align=left;" parent="1" vertex="1">
+          <mxGeometry x="640" y="2385" width="520" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_post" value="&lt;b&gt;Stage 3: Post grid_sync (可选)&lt;/b&gt;&lt;br&gt;• 把 SM 0 感知的 cross-rank 同步传播给本 rank 所有 SM&lt;br&gt;• 后续 compute 可以放心读取远端数据&lt;br&gt;&lt;i&gt;[sync_epilogue=true]&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1180" y="2385" width="520" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_calls_title" value="&lt;b&gt;Mega MoE 中的 3 次 nvlink_barrier 调用&lt;/b&gt;" style="text;html=1;align=left;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="2510" width="600" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_call1" value="&lt;b&gt;#1 · Tag=1 · kBeforeDispatchPullBarrierTag&lt;/b&gt;&lt;br&gt;时机: Dispatch count 写完 expert count 之后，pull 之前&lt;br&gt;保证: 所有 rank 的 expert_send_count 对所有 pull 者可见&lt;br&gt;&lt;i&gt;sync_prologue=false&lt;/i&gt; (前面已有 grid_sync) · &lt;i&gt;sync_epilogue=true&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="100" y="2540" width="720" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_call2" value="&lt;b&gt;#2 · Tag=2 · kBeforeCombineReduceBarrierTag&lt;/b&gt;&lt;br&gt;时机: L2 输出 NVLink 写入 combine_token_buffer 完成后，reduce 开始前&lt;br&gt;保证: 所有 rank 的 top-k 结果都已跨 rank 投递&lt;br&gt;&lt;i&gt;sync_prologue=true · sync_epilogue=true&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="840" y="2540" width="720" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="nv_call3" value="&lt;b&gt;#3 · Tag=3 · kAfterWorkspaceCleanBarrierTag&lt;/b&gt;&lt;br&gt;时机: Dispatch 的 cleanup 完成之后，kernel 退出前&lt;br&gt;保证: 所有 rank 的 workspace 都已清零&lt;br&gt;&lt;i&gt;sync_prologue=true · sync_epilogue=false&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="1580" y="2540" width="720" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s7_title" value="⑦ Per-block Arrival — 细粒度跨 SM 数据依赖（无锁）" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#1A237E;" parent="1" vertex="1">
+          <mxGeometry x="80" y="2750" width="800" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s7_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1A237E;strokeWidth=2;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="80" y="2790" width="2240" height="320" as="geometry" />
+        </mxCell>
+        <mxCell id="pb_l1" value="&lt;b&gt;l1_arrival_count[pool_block] (uint32)&lt;/b&gt; — Dispatch → TMA-A&lt;hr&gt;&lt;b&gt;Producer (Dispatch warp, 每 token):&lt;/b&gt;&lt;br&gt;red.release.gpu.add.u32 [ptr], 1&lt;br&gt;&lt;b&gt;Consumer (TMA-A warp, 每 Block 一次):&lt;/b&gt;&lt;br&gt;while (ld.acquire.gpu.b32 != expected);&lt;br&gt;&lt;b&gt;语义:&lt;/b&gt; Block b 的 tokens 全部 pull 完成 → L1 GEMM 可开始" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="100" y="2820" width="700" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="pb_l2" value="&lt;b&gt;l2_arrival_mask[pool_block] (uint64, bitmask)&lt;/b&gt; — L1 Epilogue → L2 TMA-A&lt;hr&gt;&lt;b&gt;Producer (L1 Epilogue, 每 N-block):&lt;/b&gt;&lt;br&gt;red.release.gpu.or.b64 [ptr], 1&amp;lt;&amp;lt;n_block_idx&lt;br&gt;&lt;b&gt;Consumer (L2 TMA-A, 每 K-block):&lt;/b&gt;&lt;br&gt;needed = 3ull &amp;lt;&amp;lt; (k_block*2);&lt;br&gt;while ((mask &amp;amp; needed) != needed) mask = ld_acq_gpu();&lt;br&gt;&lt;b&gt;为什么用 bitmask?&lt;/b&gt; L1-N 与 L2-K 粒度不同，counter 无法表达&amp;quot;需要哪两个 N block&amp;quot;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=11;align=left;" parent="1" vertex="1">
+          <mxGeometry x="820" y="2820" width="700" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="pb_why" value="&lt;b&gt;为什么不用 mbarrier？&lt;/b&gt;&lt;hr&gt;• mbarrier 只能跨 Cluster (2 CTAs)&lt;br&gt;• Mega MoE 中 producer/consumer 可能在 148 个 SM 的任意位置&lt;br&gt;• 必须用 GPU 级 atomic (.gpu scope) 才能跨任意 SM&lt;br&gt;&lt;br&gt;&lt;b&gt;为什么用 release/acquire 而非 relaxed？&lt;/b&gt;&lt;br&gt;• release 保证 token 数据 TMA store 全局可见后再 counter+1&lt;br&gt;• acquire 保证读到 counter 后，后续 load 能看到正确数据&lt;br&gt;• relaxed 会导致 counter 先可见但数据未可见 → 读脏数据" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFDE7;strokeColor=#FBC02D;fontSize=11;align=left;strokeWidth=2;" parent="1" vertex="1">
+          <mxGeometry x="1540" y="2820" width="760" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="s8_title" value="⑧ Barrier 开销与使用频率速查表" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontStyle=1;fontColor=#1A237E;" parent="1" vertex="1">
+          <mxGeometry x="80" y="3140" width="800" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="s8_box" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1A237E;strokeWidth=2;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="80" y="3180" width="2240" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="tbl_h1" value="Barrier 类型" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#1A237E;fontColor=#FFFFFF;fontSize=11;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="100" y="3210" width="300" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="tbl_h2" value="最优延迟" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#1A237E;fontColor=#FFFFFF;fontSize=11;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="400" y="3210" width="180" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="tbl_h3" value="稳态延迟 (流水重叠)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#1A237E;fontColor=#FFFFFF;fontSize=11;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="580" y="3210" width="220" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="tbl_h4" value="调用频率" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#1A237E;fontColor=#FFFFFF;fontSize=11;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="800" y="3210" width="300" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="tbl_h5" value="对性能的影响" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#1A237E;fontColor=#FFFFFF;fontSize=11;fontStyle=1;" parent="1" vertex="1">
+          <mxGeometry x="1100" y="3210" width="1200" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="tr1_1" value="__syncwarp()" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E1D5E7;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="100" y="3240" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr1_2" value="&amp;lt;5 cyc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="400" y="3240" width="180" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr1_3" value="~10 cyc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="580" y="3240" width="220" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr1_4" value="每 ~10 条指令" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="800" y="3240" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr1_5" value="基本免费，TMA/MMA issue 路径必需" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1100" y="3240" width="1200" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr2_1" value="bar.sync (WG/Epi)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DAE8FC;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="100" y="3262" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr2_2" value="~30 cyc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="400" y="3262" width="180" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr2_3" value="~40 cyc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="580" y="3262" width="220" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr2_4" value="每 GEMM block (几十 KB 一次)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="800" y="3262" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr2_5" value="可忽略，BW-bound 下被 TMA 掩盖" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1100" y="3262" width="1200" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr3_1" value="barrier.sync (unaligned, id 1)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F8CECC;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="100" y="3284" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr3_2" value="~50 cyc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="400" y="3284" width="180" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr3_3" value="~100 cyc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="580" y="3284" width="220" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr3_4" value="3 次/kernel" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="800" y="3284" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr3_5" value="可忽略 (总计 &amp;lt; 300 cycles)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1100" y="3284" width="1200" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr4_1" value="mbarrier wait (full/empty)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#D5E8D4;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="100" y="3306" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr4_2" value="~100 cyc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="400" y="3306" width="180" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr4_3" value="&lt;b&gt;~0 (流水重叠)&lt;/b&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#C8E6C9;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="580" y="3306" width="220" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr4_4" value="每 stage (kNumStages × kNumBlocks)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="800" y="3306" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr4_5" value="关键优化：producer 始终领先 consumer，wait 不阻塞" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1100" y="3306" width="1200" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr5_1" value="l1/l2_arrival (spin-wait)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFE6CC;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="100" y="3328" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr5_2" value="~50 cyc" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="400" y="3328" width="180" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr5_3" value="0.5 - 50 μs (取决于生产者)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFE0B2;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="580" y="3328" width="220" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr5_4" value="每 Block (几十次/kernel)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="800" y="3328" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr5_5" value="NVLink 拥塞时的真正瓶颈 — 需监控" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1100" y="3328" width="1200" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr6_1" value="grid_sync / nvlink_barrier" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E1BEE7;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="100" y="3350" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr6_2" value="~1.5 / ~4 μs" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="400" y="3350" width="180" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr6_3" value="同 (固定开销)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFE0B2;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="580" y="3350" width="220" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr6_4" value="~10 + 3 次/kernel" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="800" y="3350" width="300" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="tr6_5" value="对小 batch 是主要开销 (~25 μs 固定)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;fontSize=10;" parent="1" vertex="1">
+          <mxGeometry x="1100" y="3350" width="1200" height="22" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
